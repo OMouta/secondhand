@@ -20,10 +20,10 @@ Required environment:
 
 ```bash
 DATABASE_URL=postgres://...
-OPENAI_API_KEY=...
 ```
 
 Postgres must have `pgvector` available. The app creates its tables on startup.
+Embeddings run locally with Transformers.js and are cached in Postgres.
 
 Build for production:
 

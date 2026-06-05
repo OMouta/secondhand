@@ -4,8 +4,10 @@ import { z } from "zod";
 export const env = createEnv({
 	server: {
 		DATABASE_URL: z.string().url(),
-		OPENAI_API_KEY: z.string().min(1),
-		EMBEDDING_MODEL: z.string().min(1).default("text-embedding-3-small"),
+		EMBEDDING_MODEL: z
+			.string()
+			.min(1)
+			.default("onnx-models/all-MiniLM-L6-v2-onnx"),
 		SERVER_URL: z.string().url().optional(),
 	},
 

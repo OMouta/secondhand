@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { moderateText, normalizeText } from "./archive";
 import {
 	averageEmbedding,
+	EMBEDDING_DIMENSIONS,
 	fromVectorLiteral,
 	toVectorLiteral,
 } from "./embedding";
@@ -21,7 +22,10 @@ describe("archive utilities", () => {
 	});
 
 	test("serializes pgvector literals", () => {
-		const vector = [0.1, 0.2, 0.3];
+		const vector = Array.from(
+			{ length: EMBEDDING_DIMENSIONS },
+			(_, index) => index / EMBEDDING_DIMENSIONS,
+		);
 
 		expect(fromVectorLiteral(toVectorLiteral(vector))).toEqual(vector);
 	});

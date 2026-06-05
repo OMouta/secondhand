@@ -1,59 +1,64 @@
-const DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small";
+import type { FeatureExtractionPipeline } from "@huggingface/transformers";
+import { pipeline } from "@huggingface/transformers";
 
-type OpenAIEmbeddingResponse = {
-	data?: Array<{
-		embedding?: Array<number>;
-	}>;
-	error?: {
-		message?: string;
-	};
-};
+const DEFAULT_EMBEDDING_MODEL = "onnx-models/all-MiniLM-L6-v2-onnx";
+export const EMBEDDING_DIMENSIONS = 384;
+
+let extractorPromise: Promise<FeatureExtractionPipeline> | undefined;
 
 export type EmbedText = (text: string) => Promise<Array<number>>;
 
+export function getEmbeddingExtractor(): Promise<FeatureExtractionPipeline> {
+	extractorPromise ??= pipeline(
+		"feature-extraction",
+		process.env.EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL,
+		{ subfolder: "" },
+	);
+	return extractorPromise;
+}
+
 export async function embedText(text: string): Promise<Array<number>> {
-	const apiKey = process.env.OPENAI_API_KEY;
-	if (!apiKey) {
-		throw new Error("OPENAI_API_KEY is required");
-	}
-
-	const response = await fetch("https://api.openai.com/v1/embeddings", {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			model: process.env.EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL,
-			input: text,
-			encoding_format: "float",
-		}),
+	const extractor = await getEmbeddingExtractor();
+	const output = await extractor(text, {
+		pooling: "mean",
+		normalize: true,
 	});
+	const embedding = Array.from(output.data, Number);
 
-	const body = (await response.json()) as OpenAIEmbeddingResponse;
-	if (!response.ok) {
-		throw new Error(body.error?.message ?? "Embedding request failed");
-	}
-
-	const embedding = body.data?.[0]?.embedding;
-	if (!embedding || embedding.length === 0) {
-		throw new Error("Embedding response did not include a vector");
+	if (embedding.length !== EMBEDDING_DIMENSIONS) {
+		throw new Error(
+			`Expected ${EMBEDDING_DIMENSIONS} embedding dimensions, received ${embedding.length}`,
+		);
 	}
 
 	return embedding;
 }
 
 export function toVectorLiteral(embedding: Array<number>): string {
+	if (embedding.length !== EMBEDDING_DIMENSIONS) {
+		throw new Error(
+			`Expected ${EMBEDDING_DIMENSIONS} embedding dimensions, received ${embedding.length}`,
+		);
+	}
+
 	return `[${embedding.map((value) => Number(value).toString()).join(",")}]`;
 }
 
 export function fromVectorLiteral(value: string): Array<number> {
-	return value
+	const embedding = value
 		.replace(/^\[/, "")
 		.replace(/\]$/, "")
 		.split(",")
 		.filter(Boolean)
 		.map(Number);
+
+	if (embedding.length !== EMBEDDING_DIMENSIONS) {
+		throw new Error(
+			`Expected ${EMBEDDING_DIMENSIONS} embedding dimensions, received ${embedding.length}`,
+		);
+	}
+
+	return embedding;
 }
 
 export function averageEmbedding(

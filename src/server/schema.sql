@@ -22,7 +22,7 @@ end $$;
 create table if not exists prompt_clusters (
 	id uuid primary key default gen_random_uuid(),
 	representative_prompt text not null,
-	embedding vector(1536) not null,
+	embedding vector(384) not null,
 	prompt_count integer not null default 0,
 	answer_count integer not null default 0,
 	status prompt_cluster_status not null default 'active',
@@ -34,7 +34,7 @@ create table if not exists prompts (
 	id uuid primary key default gen_random_uuid(),
 	text text not null,
 	normalized_text text not null,
-	embedding vector(1536) not null,
+	embedding vector(384) not null,
 	cluster_id uuid not null references prompt_clusters(id) on delete restrict,
 	matched_similarity double precision,
 	created_at timestamptz not null default now()
@@ -45,7 +45,7 @@ create table if not exists answers (
 	cluster_id uuid not null references prompt_clusters(id) on delete restrict,
 	text text not null,
 	normalized_text text not null,
-	embedding vector(1536) not null,
+	embedding vector(384) not null,
 	status answer_status not null default 'active',
 	report_count integer not null default 0,
 	created_at timestamptz not null default now(),
@@ -60,12 +60,26 @@ create table if not exists reports (
 	created_at timestamptz not null default now()
 );
 
+create table if not exists embedding_cache (
+	id uuid primary key default gen_random_uuid(),
+	usage text not null check (usage in ('prompt', 'answer')),
+	normalized_text text not null,
+	embedding vector(384) not null,
+	created_at timestamptz not null default now(),
+	unique (usage, normalized_text)
+);
+
 create index if not exists prompt_clusters_embedding_hnsw_idx
 	on prompt_clusters using hnsw (embedding vector_cosine_ops);
 
 create index if not exists answers_embedding_hnsw_idx
 	on answers using hnsw (embedding vector_cosine_ops);
 
+create index if not exists embedding_cache_embedding_hnsw_idx
+	on embedding_cache using hnsw (embedding vector_cosine_ops);
+
 create index if not exists prompts_cluster_id_idx on prompts(cluster_id);
+create index if not exists prompts_normalized_text_idx on prompts(normalized_text);
 create index if not exists answers_cluster_id_status_idx on answers(cluster_id, status);
+create index if not exists answers_normalized_text_idx on answers(normalized_text);
 create index if not exists reports_answer_id_idx on reports(answer_id);

@@ -74,6 +74,8 @@ type ArchiveDependencies = {
 	random?: () => number;
 };
 
+type EmbeddingUsage = "prompt" | "answer";
+
 type ClusterMatch = {
 	id: string;
 	representativePrompt: string;
@@ -149,10 +151,14 @@ export async function askArchive(
 	}
 
 	const pool = await readyPool(dependencies.pool);
-	const embedding = await (dependencies.embed ?? embedText)(prompt);
 	const random = dependencies.random ?? Math.random;
 
 	return withTransaction(pool, async (client) => {
+		const embedding = await getCachedEmbedding(client, {
+			usage: "prompt",
+			text: prompt,
+			embed: dependencies.embed ?? embedText,
+		});
 		const cluster = await findOrCreateCluster(client, prompt, embedding);
 		const promptId = await insertPrompt(client, {
 			text: prompt,
@@ -205,12 +211,18 @@ export async function leaveAnswer(
 
 	const pool = await readyPool(dependencies.pool);
 	const embed = dependencies.embed ?? embedText;
-	const [promptEmbedding, answerEmbedding] = await Promise.all([
-		embed(prompt),
-		embed(answer),
-	]);
 
 	return withTransaction(pool, async (client) => {
+		const promptEmbedding = await getCachedEmbedding(client, {
+			usage: "prompt",
+			text: prompt,
+			embed,
+		});
+		const answerEmbedding = await getCachedEmbedding(client, {
+			usage: "answer",
+			text: answer,
+			embed,
+		});
 		const cluster = await findOrCreateCluster(client, prompt, promptEmbedding);
 		const promptId = await insertPrompt(client, {
 			text: prompt,
@@ -476,6 +488,100 @@ async function findOrCreateCluster(
 		promptCount: createdRow.prompt_count,
 		similarity: 1,
 	};
+}
+
+async function getCachedEmbedding(
+	client: PoolClient,
+	input: {
+		usage: EmbeddingUsage;
+		text: string;
+		embed: EmbedText;
+	},
+): Promise<Array<number>> {
+	const normalizedText = normalizeText(input.text);
+	const cached = await client.query<{ embedding: string }>(
+		`
+			select embedding::text
+			from embedding_cache
+			where usage = $1
+				and normalized_text = $2
+			limit 1
+		`,
+		[input.usage, normalizedText],
+	);
+
+	const cachedRow = cached.rows[0];
+	if (cachedRow) {
+		return fromVectorLiteral(cachedRow.embedding);
+	}
+
+	const existing =
+		input.usage === "prompt"
+			? await findExistingPromptEmbedding(client, normalizedText)
+			: await findExistingAnswerEmbedding(client, normalizedText);
+
+	if (existing) {
+		await cacheEmbedding(client, input.usage, normalizedText, existing);
+		return existing;
+	}
+
+	const embedding = await input.embed(input.text);
+	await cacheEmbedding(client, input.usage, normalizedText, embedding);
+	return embedding;
+}
+
+async function findExistingPromptEmbedding(
+	client: PoolClient,
+	normalizedText: string,
+): Promise<Array<number> | undefined> {
+	const result = await client.query<{ embedding: string }>(
+		`
+			select embedding::text
+			from prompts
+			where normalized_text = $1
+			order by created_at desc
+			limit 1
+		`,
+		[normalizedText],
+	);
+
+	const row = result.rows[0];
+	return row ? fromVectorLiteral(row.embedding) : undefined;
+}
+
+async function findExistingAnswerEmbedding(
+	client: PoolClient,
+	normalizedText: string,
+): Promise<Array<number> | undefined> {
+	const result = await client.query<{ embedding: string }>(
+		`
+			select embedding::text
+			from answers
+			where normalized_text = $1
+			order by created_at desc
+			limit 1
+		`,
+		[normalizedText],
+	);
+
+	const row = result.rows[0];
+	return row ? fromVectorLiteral(row.embedding) : undefined;
+}
+
+async function cacheEmbedding(
+	client: PoolClient,
+	usage: EmbeddingUsage,
+	normalizedText: string,
+	embedding: Array<number>,
+): Promise<void> {
+	await client.query(
+		`
+			insert into embedding_cache (usage, normalized_text, embedding)
+			values ($1, $2, $3::vector)
+			on conflict (usage, normalized_text) do nothing
+		`,
+		[usage, normalizedText, toVectorLiteral(embedding)],
+	);
 }
 
 async function insertPrompt(

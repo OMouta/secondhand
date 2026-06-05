@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { askArchive, leaveAnswer } from "./archive";
 import { migratePool } from "./db";
 import type { EmbedText } from "./embedding";
+import { EMBEDDING_DIMENSIONS } from "./embedding";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -55,7 +56,10 @@ describe.skipIf(!databaseUrl)("archive pgvector integration", () => {
 
 const testEmbed: EmbedText = async (text) => {
 	const normalized = text.toLowerCase();
-	const vector: Array<number> = Array.from({ length: 1536 }, () => 0);
+	const vector: Array<number> = Array.from(
+		{ length: EMBEDDING_DIMENSIONS },
+		() => 0,
+	);
 
 	if (normalized.includes("react")) {
 		vector[0] = 1;
@@ -68,7 +72,7 @@ const testEmbed: EmbedText = async (text) => {
 	}
 	const hasSignal = vector.some((value) => value !== 0);
 	if (!hasSignal) {
-		vector[1535] = 1;
+		vector[EMBEDDING_DIMENSIONS - 1] = 1;
 	}
 
 	return vector;
