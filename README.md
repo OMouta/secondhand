@@ -10,6 +10,12 @@ Install dependencies:
 pnpm install
 ```
 
+Start Postgres:
+
+```bash
+docker compose up -d
+```
+
 Start the dev server:
 
 ```bash
@@ -19,16 +25,16 @@ pnpm dev
 Required environment:
 
 ```bash
-DATABASE_URL=postgres://...
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/secondhand
 ```
 
 Postgres must have `pgvector` available. Migrations are managed with Drizzle.
 Embeddings run locally with Transformers.js and are cached in Postgres.
 
-Apply migrations before starting the app:
+Create the local database, enable `pgvector`, and apply migrations:
 
 ```bash
-pnpm db:migrate
+pnpm db:setup
 ```
 
 Build for production:

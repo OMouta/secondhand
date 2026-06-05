@@ -11,7 +11,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
+    "db:setup": "node scripts/setup-db.mjs && pnpm db:migrate",
     "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
     "format": "biome format",
     "lint": "biome lint",
     "check": "biome check"
