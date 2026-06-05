@@ -1,9 +1,8 @@
-import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
+import schemaSql from "./schema.sql?raw";
 
 let pool: Pool | undefined;
+let migration: Promise<void> | undefined;
 
 export function getPool(): Pool {
 	if (!pool) {
@@ -18,18 +17,23 @@ export function getPool(): Pool {
 	return pool;
 }
 
+export async function migratePool(targetPool: Pool): Promise<void> {
+	await targetPool.query(schemaSql);
+}
+
 export async function migrateDatabase(): Promise<void> {
-	const schemaPath = join(
-		dirname(fileURLToPath(import.meta.url)),
-		"schema.sql",
-	);
-	const schema = await readFile(schemaPath, "utf8");
-	await getPool().query(schema);
+	await migratePool(getPool());
+}
+
+export function ensureDatabase(): Promise<void> {
+	migration ??= migrateDatabase();
+	return migration;
 }
 
 export async function closePool(): Promise<void> {
 	if (pool) {
 		await pool.end();
 		pool = undefined;
+		migration = undefined;
 	}
 }

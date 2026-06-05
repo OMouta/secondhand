@@ -1,39 +1,12 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-
-export type ArchiveAnswer = {
-	id: string;
-	promptId: string;
-	text: string;
-	status: "active" | "hidden";
-	score: number;
-	reportCount: number;
-	createdAt: string;
-	updatedAt: string;
-};
-
-export type ArchivePrompt = {
-	id: string;
-	text: string;
-	normalizedText: string;
-	tokens: Array<string>;
-	answerIds: Array<string>;
-	createdAt: string;
-	updatedAt: string;
-};
-
-export type ArchiveReport = {
-	id: string;
-	answerId: string;
-	reason: ReportReason;
-	createdAt: string;
-};
-
-export type ArchiveState = {
-	prompts: Array<ArchivePrompt>;
-	answers: Array<ArchiveAnswer>;
-	reports: Array<ArchiveReport>;
-};
+import type { Pool, PoolClient } from "pg";
+import { ensureDatabase, getPool } from "./db";
+import type { EmbedText } from "./embedding";
+import {
+	averageEmbedding,
+	embedText,
+	fromVectorLiteral,
+	toVectorLiteral,
+} from "./embedding";
 
 export type AskArchiveInput = {
 	prompt: string;
@@ -95,66 +68,39 @@ export type ModerationReason =
 	| "private_info"
 	| "dangerous";
 
-type Match = {
-	prompt: ArchivePrompt;
-	score: number;
+type ArchiveDependencies = {
+	pool?: Pool;
+	embed?: EmbedText;
+	random?: () => number;
 };
 
-const MATCH_THRESHOLD = 0.38;
-const DUPLICATE_THRESHOLD = 0.9;
+type ClusterMatch = {
+	id: string;
+	representativePrompt: string;
+	embedding: Array<number>;
+	promptCount: number;
+	similarity: number;
+};
+
+type ClusterRow = {
+	id: string;
+	representative_prompt: string;
+	embedding: string;
+	prompt_count: number;
+	similarity: number;
+};
+
+type AnswerRow = {
+	id: string;
+	text: string;
+	report_count: number;
+};
+
+const MATCH_THRESHOLD = 0.78;
+const DUPLICATE_THRESHOLD = 0.92;
 const REPORT_HIDE_THRESHOLD = 3;
 const MAX_PROMPT_LENGTH = 500;
 const MAX_ANSWER_LENGTH = 1_000;
-
-const STOP_WORDS = new Set([
-	"a",
-	"an",
-	"and",
-	"are",
-	"be",
-	"best",
-	"do",
-	"for",
-	"get",
-	"how",
-	"i",
-	"in",
-	"is",
-	"it",
-	"me",
-	"my",
-	"of",
-	"on",
-	"or",
-	"should",
-	"the",
-	"to",
-	"want",
-	"way",
-	"what",
-	"with",
-]);
-
-const SYNONYMS: Record<string, string> = {
-	advise: "advice",
-	advises: "advice",
-	begin: "start",
-	beginners: "beginner",
-	better: "improve",
-	communicate: "communication",
-	fast: "quick",
-	faster: "quick",
-	help: "advice",
-	improving: "improve",
-	js: "javascript",
-	learned: "learn",
-	learning: "learn",
-	learnt: "learn",
-	quickly: "quick",
-	reactjs: "react",
-	starting: "start",
-	study: "learn",
-};
 
 const DANGEROUS_PATTERNS = [
 	/\bbuild\s+(a\s+)?bomb\b/i,
@@ -184,19 +130,10 @@ const SPAM_PATTERNS = [
 	/\bfree\s+money\b/i,
 ];
 
-export function createEmptyArchive(): ArchiveState {
-	return {
-		prompts: [],
-		answers: [],
-		reports: [],
-	};
-}
-
-export function askArchive(
-	state: ArchiveState,
+export async function askArchive(
 	input: AskArchiveInput,
-	random = Math.random,
-): AskArchiveResult {
+	dependencies: ArchiveDependencies = {},
+): Promise<AskArchiveResult> {
 	const prompt = cleanText(input.prompt);
 	if (isSafetyPrompt(prompt)) {
 		return {
@@ -206,334 +143,232 @@ export function askArchive(
 		};
 	}
 
-	const match = findBestPromptMatch(state, prompt);
-	if (!match || match.score < MATCH_THRESHOLD) {
-		return {
-			type: "no_answer",
-			prompt,
-		};
+	const moderation = moderateText(prompt, MAX_PROMPT_LENGTH);
+	if (moderation) {
+		return { type: "no_answer", prompt };
 	}
 
-	const excluded = new Set(input.excludeAnswerIds ?? []);
-	const candidates = state.answers.filter(
-		(answer) =>
-			answer.promptId === match.prompt.id &&
-			answer.status === "active" &&
-			!excluded.has(answer.id),
-	);
+	const pool = await readyPool(dependencies.pool);
+	const embedding = await (dependencies.embed ?? embedText)(prompt);
+	const random = dependencies.random ?? Math.random;
 
-	const fallbackCandidates = state.answers.filter(
-		(answer) =>
-			answer.promptId === match.prompt.id && answer.status === "active",
-	);
+	return withTransaction(pool, async (client) => {
+		const cluster = await findOrCreateCluster(client, prompt, embedding);
+		const promptId = await insertPrompt(client, {
+			text: prompt,
+			embedding,
+			clusterId: cluster.id,
+			matchedSimilarity: cluster.similarity,
+		});
 
-	const answer = pickWeightedAnswer(
-		candidates.length > 0 ? candidates : fallbackCandidates,
-		random,
-	);
+		await updateClusterForPrompt(client, cluster, embedding);
 
-	if (!answer) {
+		const answer =
+			(await pickAnswer(
+				client,
+				cluster.id,
+				input.excludeAnswerIds ?? [],
+				random,
+			)) ?? (await pickAnswer(client, cluster.id, [], random));
+
+		if (!answer || cluster.similarity < MATCH_THRESHOLD) {
+			return {
+				type: "no_answer",
+				prompt,
+			};
+		}
+
 		return {
-			type: "no_answer",
-			prompt,
+			type: "answer",
+			promptId,
+			answer,
+			matchScore: roundScore(cluster.similarity),
 		};
-	}
-
-	return {
-		type: "answer",
-		promptId: match.prompt.id,
-		answer: toPublicAnswer(answer),
-		matchScore: roundScore(match.score),
-	};
+	});
 }
 
-export function leaveAnswer(
-	state: ArchiveState,
+export async function leaveAnswer(
 	input: LeaveAnswerInput,
-	now = new Date(),
-): LeaveAnswerResult {
-	const promptText = cleanText(input.prompt);
-	const answerText = cleanText(input.answer);
-	const promptModeration = moderateText(promptText, MAX_PROMPT_LENGTH);
+	dependencies: ArchiveDependencies = {},
+): Promise<LeaveAnswerResult> {
+	const prompt = cleanText(input.prompt);
+	const answer = cleanText(input.answer);
+	const promptModeration = moderateText(prompt, MAX_PROMPT_LENGTH);
 	if (promptModeration) {
 		return { type: "rejected", reason: promptModeration };
 	}
 
-	const answerModeration = moderateText(answerText, MAX_ANSWER_LENGTH);
+	const answerModeration = moderateText(answer, MAX_ANSWER_LENGTH);
 	if (answerModeration) {
 		return { type: "rejected", reason: answerModeration };
 	}
 
-	const matchedPrompt = findBestPromptMatch(state, promptText);
-	const prompt =
-		matchedPrompt && matchedPrompt.score >= MATCH_THRESHOLD
-			? matchedPrompt.prompt
-			: createPrompt(promptText, now);
+	const pool = await readyPool(dependencies.pool);
+	const embed = dependencies.embed ?? embedText;
+	const [promptEmbedding, answerEmbedding] = await Promise.all([
+		embed(prompt),
+		embed(answer),
+	]);
 
-	const duplicate = state.answers
-		.filter(
-			(answer) => answer.promptId === prompt.id && answer.status === "active",
-		)
-		.some(
-			(answer) =>
-				textSimilarity(answer.text, answerText) >= DUPLICATE_THRESHOLD ||
-				normalizedText(answer.text) === normalizedText(answerText),
+	return withTransaction(pool, async (client) => {
+		const cluster = await findOrCreateCluster(client, prompt, promptEmbedding);
+		const promptId = await insertPrompt(client, {
+			text: prompt,
+			embedding: promptEmbedding,
+			clusterId: cluster.id,
+			matchedSimilarity: cluster.similarity,
+		});
+
+		await updateClusterForPrompt(client, cluster, promptEmbedding);
+
+		const duplicate = await hasDuplicateAnswer(client, {
+			clusterId: cluster.id,
+			answer,
+			embedding: answerEmbedding,
+		});
+
+		if (duplicate) {
+			return { type: "already_there" };
+		}
+
+		const created = await client.query<AnswerRow>(
+			`
+				insert into answers (cluster_id, text, normalized_text, embedding)
+				values ($1, $2, $3, $4::vector)
+				returning id, text
+			`,
+			[
+				cluster.id,
+				answer,
+				normalizeText(answer),
+				toVectorLiteral(answerEmbedding),
+			],
 		);
 
-	if (duplicate) {
-		return { type: "already_there" };
-	}
+		await client.query(
+			`
+				update prompt_clusters
+				set answer_count = answer_count + 1,
+					updated_at = now()
+				where id = $1
+			`,
+			[cluster.id],
+		);
 
-	if (!state.prompts.some((storedPrompt) => storedPrompt.id === prompt.id)) {
-		state.prompts.push(prompt);
-	}
+		const row = created.rows[0];
+		if (!row) {
+			throw new Error("Answer insert failed");
+		}
 
-	const answer = createAnswer(prompt.id, answerText, now);
-	state.answers.push(answer);
-	prompt.answerIds.push(answer.id);
-	prompt.updatedAt = now.toISOString();
-
-	return {
-		type: "created",
-		promptId: prompt.id,
-		answer: toPublicAnswer(answer),
-	};
+		return {
+			type: "created",
+			promptId,
+			answer: {
+				id: row.id,
+				text: row.text,
+			},
+		};
+	});
 }
 
-export function reportAnswer(
-	state: ArchiveState,
+export async function reportAnswer(
 	answerId: string,
 	reason: ReportReason,
-	now = new Date(),
-): { ok: true; hidden: boolean } | { ok: false; reason: "not_found" } {
-	const answer = state.answers.find((candidate) => candidate.id === answerId);
-	if (!answer) {
-		return { ok: false, reason: "not_found" };
-	}
+	dependencies: Pick<ArchiveDependencies, "pool"> = {},
+): Promise<{ ok: true; hidden: boolean } | { ok: false; reason: "not_found" }> {
+	const pool = await readyPool(dependencies.pool);
 
-	state.reports.push({
-		id: createId(),
-		answerId,
-		reason,
-		createdAt: now.toISOString(),
+	return withTransaction(pool, async (client) => {
+		const answer = await client.query<{
+			id: string;
+			cluster_id: string;
+			report_count: number;
+			status: string;
+		}>(
+			`
+				select id, cluster_id, report_count, status
+				from answers
+				where id = $1
+				for update
+			`,
+			[answerId],
+		);
+
+		const row = answer.rows[0];
+		if (!row) {
+			return { ok: false, reason: "not_found" };
+		}
+
+		await client.query(
+			`
+				insert into reports (answer_id, reason)
+				values ($1, $2)
+			`,
+			[answerId, reason],
+		);
+
+		const nextReportCount = row.report_count + 1;
+		const hidden =
+			row.status !== "hidden" && nextReportCount >= REPORT_HIDE_THRESHOLD;
+		await client.query(
+			`
+				update answers
+				set report_count = $2,
+					status = case when $3 then 'hidden'::answer_status else status end,
+					updated_at = now()
+				where id = $1
+			`,
+			[answerId, nextReportCount, hidden],
+		);
+
+		if (hidden) {
+			await client.query(
+				`
+					update prompt_clusters
+					set answer_count = greatest(0, answer_count - 1),
+						updated_at = now()
+					where id = $1
+				`,
+				[row.cluster_id],
+			);
+		}
+
+		return { ok: true, hidden: row.status === "hidden" || hidden };
 	});
-
-	answer.reportCount += 1;
-	answer.score = Math.max(0, answer.score - 2);
-	answer.updatedAt = now.toISOString();
-
-	if (answer.reportCount >= REPORT_HIDE_THRESHOLD) {
-		answer.status = "hidden";
-	}
-
-	return { ok: true, hidden: answer.status === "hidden" };
 }
 
-export function getArchiveStats(state: ArchiveState) {
-	return {
-		promptCount: state.prompts.length,
-		answerCount: state.answers.filter((answer) => answer.status === "active")
-			.length,
-		hiddenAnswerCount: state.answers.filter(
-			(answer) => answer.status === "hidden",
-		).length,
-		reportCount: state.reports.length,
-	};
-}
-
-export async function readArchive(
-	path = defaultArchivePath(),
-): Promise<ArchiveState> {
-	try {
-		const raw = await readFile(path, "utf8");
-		const parsed = JSON.parse(raw) as ArchiveState;
-		return {
-			prompts: Array.isArray(parsed.prompts) ? parsed.prompts : [],
-			answers: Array.isArray(parsed.answers) ? parsed.answers : [],
-			reports: Array.isArray(parsed.reports) ? parsed.reports : [],
-		};
-	} catch (error) {
-		if (isNodeError(error) && error.code === "ENOENT") {
-			return createEmptyArchive();
-		}
-		throw error;
-	}
-}
-
-export async function writeArchive(
-	state: ArchiveState,
-	path = defaultArchivePath(),
-): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
-	await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-}
-
-export async function updateArchive<T>(
-	operation: (state: ArchiveState) => T | Promise<T>,
-	path = defaultArchivePath(),
-): Promise<T> {
-	const state = await readArchive(path);
-	const result = await operation(state);
-	await writeArchive(state, path);
-	return result;
-}
-
-function findBestPromptMatch(
-	state: ArchiveState,
-	prompt: string,
-): Match | undefined {
-	const scored = state.prompts
-		.map((candidate) => ({
-			prompt: candidate,
-			score: promptSimilarity(prompt, candidate),
-		}))
-		.sort((left, right) => right.score - left.score);
-
-	return scored[0];
-}
-
-function promptSimilarity(prompt: string, candidate: ArchivePrompt): number {
-	const promptTokens = tokenize(prompt);
-	const tokenScore = jaccard(
-		meaningfulTokens(promptTokens),
-		meaningfulTokens(candidate.tokens),
+export async function getArchiveStats(
+	dependencies: Pick<ArchiveDependencies, "pool"> = {},
+) {
+	const pool = await readyPool(dependencies.pool);
+	const result = await pool.query<{
+		prompt_count: string;
+		cluster_count: string;
+		answer_count: string;
+		hidden_answer_count: string;
+		report_count: string;
+	}>(
+		`
+			select
+				(select count(*) from prompts) as prompt_count,
+				(select count(*) from prompt_clusters) as cluster_count,
+				(select count(*) from answers where status = 'active') as answer_count,
+				(select count(*) from answers where status = 'hidden') as hidden_answer_count,
+				(select count(*) from reports) as report_count
+		`,
 	);
-	const charScore = textSimilarity(prompt, candidate.text);
-	const containmentScore = containsMeaningfulTokens(
-		promptTokens,
-		candidate.tokens,
-	)
-		? 0.72
-		: 0;
 
-	return Math.max(tokenScore, charScore, containmentScore);
-}
-
-function textSimilarity(left: string, right: string): number {
-	const normalizedLeft = normalizedText(left);
-	const normalizedRight = normalizedText(right);
-	if (!normalizedLeft || !normalizedRight) {
-		return 0;
-	}
-	if (normalizedLeft === normalizedRight) {
-		return 1;
-	}
-	return diceCoefficient(trigrams(normalizedLeft), trigrams(normalizedRight));
-}
-
-function containsMeaningfulTokens(
-	leftTokens: Array<string>,
-	rightTokens: Array<string>,
-): boolean {
-	const left = meaningfulTokens(leftTokens);
-	const right = new Set(meaningfulTokens(rightTokens));
-	return left.length > 0 && left.every((token) => right.has(token));
-}
-
-function meaningfulTokens(tokens: Array<string>): Array<string> {
-	return tokens.filter((token) => !STOP_WORDS.has(token));
-}
-
-function pickWeightedAnswer(
-	answers: Array<ArchiveAnswer>,
-	random: () => number,
-): ArchiveAnswer | undefined {
-	if (answers.length === 0) {
-		return undefined;
-	}
-
-	const totalWeight = answers.reduce(
-		(total, answer) =>
-			total + Math.max(1, answer.score - answer.reportCount * 2),
-		0,
-	);
-	let cursor = random() * totalWeight;
-
-	for (const answer of answers) {
-		cursor -= Math.max(1, answer.score - answer.reportCount * 2);
-		if (cursor <= 0) {
-			return answer;
-		}
-	}
-
-	return answers.at(-1);
-}
-
-function moderateText(
-	text: string,
-	maxLength: number,
-): ModerationReason | undefined {
-	if (!text) {
-		return "empty";
-	}
-	if (text.length > maxLength) {
-		return "too_long";
-	}
-	if (SPAM_PATTERNS.some((pattern) => pattern.test(text))) {
-		return "spam";
-	}
-	if (ABUSE_PATTERNS.some((pattern) => pattern.test(text))) {
-		return "abuse";
-	}
-	if (PRIVATE_INFO_PATTERNS.some((pattern) => pattern.test(text))) {
-		return "private_info";
-	}
-	if (DANGEROUS_PATTERNS.some((pattern) => pattern.test(text))) {
-		return "dangerous";
-	}
-	return undefined;
-}
-
-function isSafetyPrompt(text: string): boolean {
-	return /\b(kill myself|suicide|end my life|hurt myself|self harm|self-harm)\b/i.test(
-		text,
-	);
-}
-
-function createPrompt(text: string, now: Date): ArchivePrompt {
+	const row = result.rows[0];
 	return {
-		id: createId(),
-		text,
-		normalizedText: normalizedText(text),
-		tokens: tokenize(text),
-		answerIds: [],
-		createdAt: now.toISOString(),
-		updatedAt: now.toISOString(),
+		promptCount: Number(row?.prompt_count ?? 0),
+		clusterCount: Number(row?.cluster_count ?? 0),
+		answerCount: Number(row?.answer_count ?? 0),
+		hiddenAnswerCount: Number(row?.hidden_answer_count ?? 0),
+		reportCount: Number(row?.report_count ?? 0),
 	};
 }
 
-function createAnswer(
-	promptId: string,
-	text: string,
-	now: Date,
-): ArchiveAnswer {
-	return {
-		id: createId(),
-		promptId,
-		text,
-		status: "active",
-		score: 10,
-		reportCount: 0,
-		createdAt: now.toISOString(),
-		updatedAt: now.toISOString(),
-	};
-}
-
-function toPublicAnswer(answer: ArchiveAnswer): PublicAnswer {
-	return {
-		id: answer.id,
-		text: answer.text,
-	};
-}
-
-function tokenize(text: string): Array<string> {
-	return normalizedText(text)
-		.split(" ")
-		.map((token) => normalizeToken(token))
-		.filter((token) => token.length > 1);
-}
-
-function normalizedText(text: string): string {
+export function normalizeText(text: string): string {
 	return text
 		.toLowerCase()
 		.normalize("NFKD")
@@ -543,92 +378,273 @@ function normalizedText(text: string): string {
 		.replace(/\s+/g, " ");
 }
 
-function normalizeToken(token: string): string {
-	const corrected = correctCommonTypo(token);
-	const synonym = SYNONYMS[corrected] ?? corrected;
-	if (synonym.endsWith("ing") && synonym.length > 5) {
-		return synonym.slice(0, -3);
+export function moderateText(
+	text: string,
+	maxLength = MAX_ANSWER_LENGTH,
+): ModerationReason | undefined {
+	const cleaned = cleanText(text);
+	if (!cleaned) {
+		return "empty";
 	}
-	if (synonym.endsWith("ed") && synonym.length > 4) {
-		return synonym.slice(0, -2);
+	if (cleaned.length > maxLength) {
+		return "too_long";
 	}
-	if (synonym.endsWith("s") && synonym.length > 3) {
-		return synonym.slice(0, -1);
+	if (SPAM_PATTERNS.some((pattern) => pattern.test(cleaned))) {
+		return "spam";
 	}
-	return synonym;
+	if (ABUSE_PATTERNS.some((pattern) => pattern.test(cleaned))) {
+		return "abuse";
+	}
+	if (PRIVATE_INFO_PATTERNS.some((pattern) => pattern.test(cleaned))) {
+		return "private_info";
+	}
+	if (DANGEROUS_PATTERNS.some((pattern) => pattern.test(cleaned))) {
+		return "dangerous";
+	}
+	return undefined;
 }
 
-function correctCommonTypo(token: string): string {
-	if (token === "leran") {
-		return "learn";
+async function readyPool(pool: Pool | undefined): Promise<Pool> {
+	if (pool) {
+		return pool;
 	}
-	if (levenshtein(token, "learn") <= 1) {
-		return "learn";
-	}
-	if (levenshtein(token, "react") <= 1) {
-		return "react";
-	}
-	return token;
+	await ensureDatabase();
+	return getPool();
 }
 
-function jaccard(left: Array<string>, right: Array<string>): number {
-	const leftSet = new Set(left);
-	const rightSet = new Set(right);
-	const intersection = [...leftSet].filter((token) =>
-		rightSet.has(token),
-	).length;
-	const union = new Set([...leftSet, ...rightSet]).size;
-	return union === 0 ? 0 : intersection / union;
+async function findOrCreateCluster(
+	client: PoolClient,
+	text: string,
+	embedding: Array<number>,
+): Promise<ClusterMatch> {
+	const vector = toVectorLiteral(embedding);
+	const match = await client.query<ClusterRow>(
+		`
+			select
+				id,
+				representative_prompt,
+				embedding::text,
+				prompt_count,
+				1 - (embedding <=> $1::vector) as similarity
+			from prompt_clusters
+			where status = 'active'
+			order by embedding <=> $1::vector
+			limit 1
+		`,
+		[vector],
+	);
+
+	const row = match.rows[0];
+	if (row && row.similarity >= MATCH_THRESHOLD) {
+		return {
+			id: row.id,
+			representativePrompt: row.representative_prompt,
+			embedding: fromVectorLiteral(row.embedding),
+			promptCount: row.prompt_count,
+			similarity: row.similarity,
+		};
+	}
+
+	const created = await client.query<ClusterRow>(
+		`
+			insert into prompt_clusters (
+				representative_prompt,
+				embedding,
+				prompt_count,
+				answer_count
+			)
+			values ($1, $2::vector, 0, 0)
+			returning
+				id,
+				representative_prompt,
+				embedding::text,
+				prompt_count,
+				1::double precision as similarity
+		`,
+		[text, vector],
+	);
+
+	const createdRow = created.rows[0];
+	if (!createdRow) {
+		throw new Error("Prompt cluster insert failed");
+	}
+
+	return {
+		id: createdRow.id,
+		representativePrompt: createdRow.representative_prompt,
+		embedding: fromVectorLiteral(createdRow.embedding),
+		promptCount: createdRow.prompt_count,
+		similarity: 1,
+	};
 }
 
-function trigrams(text: string): Array<string> {
-	const value = `  ${text}  `;
-	return Array.from({ length: Math.max(0, value.length - 2) }, (_, index) =>
-		value.slice(index, index + 3),
+async function insertPrompt(
+	client: PoolClient,
+	input: {
+		text: string;
+		embedding: Array<number>;
+		clusterId: string;
+		matchedSimilarity: number;
+	},
+): Promise<string> {
+	const result = await client.query<{ id: string }>(
+		`
+			insert into prompts (
+				text,
+				normalized_text,
+				embedding,
+				cluster_id,
+				matched_similarity
+			)
+			values ($1, $2, $3::vector, $4, $5)
+			returning id
+		`,
+		[
+			input.text,
+			normalizeText(input.text),
+			toVectorLiteral(input.embedding),
+			input.clusterId,
+			roundScore(input.matchedSimilarity),
+		],
+	);
+
+	const row = result.rows[0];
+	if (!row) {
+		throw new Error("Prompt insert failed");
+	}
+
+	return row.id;
+}
+
+async function updateClusterForPrompt(
+	client: PoolClient,
+	cluster: ClusterMatch,
+	embedding: Array<number>,
+): Promise<void> {
+	const nextEmbedding = averageEmbedding(
+		cluster.embedding,
+		embedding,
+		cluster.promptCount,
+	);
+	await client.query(
+		`
+			update prompt_clusters
+			set embedding = $2::vector,
+				prompt_count = prompt_count + 1,
+				updated_at = now()
+			where id = $1
+		`,
+		[cluster.id, toVectorLiteral(nextEmbedding)],
 	);
 }
 
-function diceCoefficient(left: Array<string>, right: Array<string>): number {
-	if (left.length === 0 || right.length === 0) {
-		return 0;
-	}
-
-	const rightCounts = new Map<string, number>();
-	for (const item of right) {
-		rightCounts.set(item, (rightCounts.get(item) ?? 0) + 1);
-	}
-
-	let intersection = 0;
-	for (const item of left) {
-		const count = rightCounts.get(item) ?? 0;
-		if (count > 0) {
-			intersection += 1;
-			rightCounts.set(item, count - 1);
-		}
-	}
-
-	return (2 * intersection) / (left.length + right.length);
-}
-
-function levenshtein(left: string, right: string): number {
-	const previous = Array.from(
-		{ length: right.length + 1 },
-		(_, index) => index,
+async function pickAnswer(
+	client: PoolClient,
+	clusterId: string,
+	excludeAnswerIds: Array<string>,
+	random: () => number,
+): Promise<PublicAnswer | undefined> {
+	const result = await client.query<AnswerRow>(
+		`
+			select id, text, report_count
+			from answers
+			where cluster_id = $1
+				and status = 'active'
+				and not (id = any($2::uuid[]))
+			order by created_at asc
+		`,
+		[clusterId, excludeAnswerIds],
 	);
 
-	for (let leftIndex = 0; leftIndex < left.length; leftIndex += 1) {
-		const current = [leftIndex + 1];
-		for (let rightIndex = 0; rightIndex < right.length; rightIndex += 1) {
-			const insert = current[rightIndex] + 1;
-			const remove = previous[rightIndex + 1] + 1;
-			const replace =
-				previous[rightIndex] + (left[leftIndex] === right[rightIndex] ? 0 : 1);
-			current.push(Math.min(insert, remove, replace));
-		}
-		previous.splice(0, previous.length, ...current);
+	const row = pickWeightedAnswer(result.rows, random);
+	if (!row) {
+		return undefined;
 	}
 
-	return previous[right.length];
+	return {
+		id: row.id,
+		text: row.text,
+	};
+}
+
+function pickWeightedAnswer(
+	answers: Array<AnswerRow>,
+	random: () => number,
+): AnswerRow | undefined {
+	if (answers.length === 0) {
+		return undefined;
+	}
+
+	const totalWeight = answers.reduce(
+		(total, answer) => total + Math.max(1, 10 - answer.report_count * 2),
+		0,
+	);
+	let cursor = random() * totalWeight;
+
+	for (const answer of answers) {
+		cursor -= Math.max(1, 10 - answer.report_count * 2);
+		if (cursor <= 0) {
+			return answer;
+		}
+	}
+
+	return answers.at(-1);
+}
+
+async function hasDuplicateAnswer(
+	client: PoolClient,
+	input: {
+		clusterId: string;
+		answer: string;
+		embedding: Array<number>;
+	},
+): Promise<boolean> {
+	const result = await client.query<{ exists: boolean }>(
+		`
+			select exists(
+				select 1
+				from answers
+				where cluster_id = $1
+					and status = 'active'
+					and (
+						normalized_text = $2
+						or 1 - (embedding <=> $3::vector) >= $4
+					)
+			) as exists
+		`,
+		[
+			input.clusterId,
+			normalizeText(input.answer),
+			toVectorLiteral(input.embedding),
+			DUPLICATE_THRESHOLD,
+		],
+	);
+
+	return Boolean(result.rows[0]?.exists);
+}
+
+async function withTransaction<T>(
+	pool: Pool,
+	operation: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+	const client = await pool.connect();
+	try {
+		await client.query("begin");
+		const result = await operation(client);
+		await client.query("commit");
+		return result;
+	} catch (error) {
+		await client.query("rollback");
+		throw error;
+	} finally {
+		client.release();
+	}
+}
+
+function isSafetyPrompt(text: string): boolean {
+	return /\b(kill myself|suicide|end my life|hurt myself|self harm|self-harm)\b/i.test(
+		text,
+	);
 }
 
 function cleanText(text: string): string {
@@ -637,16 +653,4 @@ function cleanText(text: string): string {
 
 function roundScore(score: number): number {
 	return Math.round(score * 100) / 100;
-}
-
-function createId(): string {
-	return crypto.randomUUID();
-}
-
-function defaultArchivePath(): string {
-	return join(process.cwd(), ".data", "secondhand-archive.json");
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-	return error instanceof Error && "code" in error;
 }

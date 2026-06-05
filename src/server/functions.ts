@@ -4,9 +4,7 @@ import {
 	askArchive,
 	getArchiveStats,
 	leaveAnswer,
-	readArchive,
 	reportAnswer,
-	updateArchive,
 } from "./archive";
 
 const askSchema = z.object({
@@ -34,28 +32,16 @@ const reportAnswerSchema = z.object({
 
 export const askSecondhand = createServerFn({ method: "POST" })
 	.inputValidator(askSchema)
-	.handler(async ({ data }) => {
-		const archive = await readArchive();
-		return askArchive(archive, data);
-	});
+	.handler(async ({ data }) => askArchive(data));
 
 export const leaveSecondhandAnswer = createServerFn({ method: "POST" })
 	.inputValidator(leaveAnswerSchema)
-	.handler(async ({ data }) =>
-		updateArchive((archive) => leaveAnswer(archive, data)),
-	);
+	.handler(async ({ data }) => leaveAnswer(data));
 
 export const reportSecondhandAnswer = createServerFn({ method: "POST" })
 	.inputValidator(reportAnswerSchema)
-	.handler(async ({ data }) =>
-		updateArchive((archive) =>
-			reportAnswer(archive, data.answerId, data.reason),
-		),
-	);
+	.handler(async ({ data }) => reportAnswer(data.answerId, data.reason));
 
 export const getSecondhandStats = createServerFn({ method: "GET" }).handler(
-	async () => {
-		const archive = await readArchive();
-		return getArchiveStats(archive);
-	},
+	async () => getArchiveStats(),
 );
