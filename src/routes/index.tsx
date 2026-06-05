@@ -7,7 +7,7 @@ import { ThemeToggle } from "#/components/theme-toggle.tsx";
 import { Button } from "#/components/ui/button.tsx";
 import { Textarea } from "#/components/ui/textarea.tsx";
 import { useKeybinds } from "#/hooks/use-keybinds.ts";
-import { type Command, filterCommands } from "#/lib/commands.ts";
+import { type Command, filterCommands, formatKeybind } from "#/lib/commands.ts";
 import { cn } from "#/lib/utils.ts";
 import {
 	askSecondhand,
@@ -76,8 +76,10 @@ function Home() {
 	const [menuIndex, setMenuIndex] = useState(0);
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 
-	const answerPrompt = view.kind === "no_answer" ? view.prompt : asked;
-	const answerMode = forceAnswer || view.kind === "no_answer";
+	// The composer always defaults to asking; leaving an answer is an explicit,
+	// opt-in mode for the current prompt (toggle below the composer or keybind).
+	const answerPrompt = asked;
+	const answerMode = forceAnswer;
 	const hasThread = view.kind !== "idle";
 
 	function applyAsk(result: AskResult, prompt: string, shown: string[]) {
@@ -205,6 +207,11 @@ function Home() {
 		command.run();
 	}
 
+	const answerCommand = commands.find((command) => command.id === "answer");
+	const answerHint = answerCommand?.keybind
+		? formatKeybind(answerCommand.keybind)
+		: "";
+
 	return (
 		<main className="mx-auto flex min-h-dvh w-full max-w-2xl flex-col px-4">
 			<header className="flex items-center justify-between py-5">
@@ -269,22 +276,6 @@ function Home() {
 				</AnimatePresence>
 
 				<motion.div layout transition={{ duration: 0.4, ease }}>
-					<AnimatePresence>
-						{forceAnswer && (
-							<motion.div
-								initial={{ opacity: 0, height: 0 }}
-								animate={{ opacity: 1, height: "auto" }}
-								exit={{ opacity: 0, height: 0 }}
-								transition={{ duration: 0.2 }}
-								className="overflow-hidden"
-							>
-								<p className="pb-2 text-xs text-muted-foreground">
-									Leaving an answer · Esc to cancel
-								</p>
-							</motion.div>
-						)}
-					</AnimatePresence>
-
 					<Composer
 						ref={inputRef}
 						value={input}
@@ -320,14 +311,61 @@ function Home() {
 						)}
 					</AnimatePresence>
 
-					<p className="pt-3 text-center text-xs text-muted-foreground/70">
-						{hasThread
-							? "Prompts and answers may be saved."
-							: "Type / for commands. Don't write private information here."}
-					</p>
+					{hasThread ? (
+						<div className="flex items-center justify-between gap-3 pt-3 text-xs">
+							<span className="text-muted-foreground/70">
+								{answerMode
+									? "Answering this prompt."
+									: "Prompts and answers may be saved."}
+							</span>
+							<AnimatePresence mode="wait" initial={false}>
+								{answerMode ? (
+									<motion.button
+										key="cancel"
+										type="button"
+										onClick={cancelAnswer}
+										initial={{ opacity: 0 }}
+										animate={{ opacity: 1 }}
+										exit={{ opacity: 0 }}
+										transition={{ duration: 0.15 }}
+										className="inline-flex shrink-0 items-center text-muted-foreground transition-colors hover:text-foreground"
+									>
+										Cancel
+										<Kbd>Esc</Kbd>
+									</motion.button>
+								) : (
+									<motion.button
+										key="leave"
+										type="button"
+										onClick={startAnswer}
+										initial={{ opacity: 0 }}
+										animate={{ opacity: 1 }}
+										exit={{ opacity: 0 }}
+										transition={{ duration: 0.15 }}
+										className="inline-flex shrink-0 items-center text-muted-foreground transition-colors hover:text-foreground"
+									>
+										Leave an answer
+										{answerHint && <Kbd>{answerHint}</Kbd>}
+									</motion.button>
+								)}
+							</AnimatePresence>
+						</div>
+					) : (
+						<p className="pt-3 text-center text-xs text-muted-foreground/70">
+							Type / for commands. Don&apos;t write private information here.
+						</p>
+					)}
 				</motion.div>
 			</div>
 		</main>
+	);
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+	return (
+		<kbd className="ml-1.5 rounded border border-border bg-muted px-1 py-0.5 font-sans text-[10px] text-muted-foreground">
+			{children}
+		</kbd>
 	);
 }
 
