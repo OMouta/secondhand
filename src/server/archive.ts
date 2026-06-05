@@ -1,7 +1,7 @@
 import { type SQL, sql } from "drizzle-orm";
 import type { Pool } from "pg";
 import type { AppDb } from "./db";
-import { createDb, ensureDatabase, getDb } from "./db";
+import { createDb, getDb } from "./db";
 import type { EmbedText } from "./embedding";
 import {
 	averageEmbedding,
@@ -417,7 +417,6 @@ async function readyDb(pool: Pool | undefined): Promise<AppDb> {
 	if (pool) {
 		return createDb(pool);
 	}
-	await ensureDatabase();
 	return getDb();
 }
 

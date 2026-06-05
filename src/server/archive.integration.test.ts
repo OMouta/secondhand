@@ -1,7 +1,6 @@
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { askArchive, leaveAnswer } from "./archive";
-import { migratePool } from "./db";
 import type { EmbedText } from "./embedding";
 import { EMBEDDING_DIMENSIONS } from "./embedding";
 
@@ -12,7 +11,6 @@ describe.skipIf(!databaseUrl)("archive pgvector integration", () => {
 
 	beforeAll(async () => {
 		pool = new Pool({ connectionString: databaseUrl });
-		await migratePool(pool);
 		await pool.query(`
 			truncate reports, answers, prompts, prompt_clusters restart identity cascade
 		`);
