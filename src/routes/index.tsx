@@ -245,8 +245,9 @@ function Composer({
 				type="button"
 				size="icon"
 				onClick={onSubmit}
-				disabled={pending || value.trim().length === 0}
-				className="absolute right-2.5 bottom-2.5 size-9 rounded-full"
+				disabled={pending}
+				aria-disabled={pending || value.trim().length === 0}
+				className="absolute right-2.5 bottom-2.5 size-9 rounded-full aria-disabled:pointer-events-none aria-disabled:opacity-50"
 				aria-label={answerMode ? "Leave an answer." : "Ask something."}
 			>
 				<AnimatePresence mode="wait" initial={false}>
