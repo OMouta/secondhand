@@ -37,10 +37,14 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
 	shellComponent: RootDocument,
 });
 
+const themeScript = `(function(){try{var t=localStorage.getItem("theme");var d=t?t==="dark":true;var c=document.documentElement.classList;d?c.add("dark"):c.remove("dark");}catch(e){document.documentElement.classList.add("dark");}})();`;
+
 function RootDocument({ children }: { children: React.ReactNode }) {
 	return (
-		<html lang="en">
+		<html lang="en" className="dark" suppressHydrationWarning>
 			<head>
+				{/** biome-ignore lint/security/noDangerouslySetInnerHtml: theme no-flash script must run before paint */}
+				<script dangerouslySetInnerHTML={{ __html: themeScript }} />
 				<HeadContent />
 			</head>
 			<body>

@@ -1,9 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ArrowUp } from "lucide-react";
+import { AnimatePresence, motion } from "framer-motion";
+import { ArrowUp, Loader2 } from "lucide-react";
 import { useRef, useState } from "react";
+import { ThemeToggle } from "#/components/theme-toggle.tsx";
 import { Button } from "#/components/ui/button.tsx";
 import { Textarea } from "#/components/ui/textarea.tsx";
-import { cn } from "#/lib/utils.ts";
 import {
 	askSecondhand,
 	leaveSecondhandAnswer,
@@ -42,36 +43,76 @@ const REJECTION_MESSAGES: Record<string, string> = {
 	dangerous: "Can't accept that.",
 };
 
-function Home() {
-	const [prompt, setPrompt] = useState("");
-	const [view, setView] = useState<View>({ kind: "idle" });
-	const [pending, setPending] = useState(false);
-	const promptRef = useRef<HTMLTextAreaElement>(null);
+const ease = [0.16, 1, 0.3, 1] as const;
 
-	function applyAsk(result: AskResult, currentPrompt: string, shown: string[]) {
+function viewKey(view: View): string {
+	switch (view.kind) {
+		case "answer":
+			return `answer:${view.shownIds[view.shownIds.length - 1]}`;
+		case "no_answer":
+			return `no_answer:${view.prompt}`;
+		case "note":
+			return `note:${view.text}`;
+		case "left":
+			return "left";
+		case "safety":
+			return "safety";
+		default:
+			return "idle";
+	}
+}
+
+function Home() {
+	const [input, setInput] = useState("");
+	const [view, setView] = useState<View>({ kind: "idle" });
+	const [error, setError] = useState<string | null>(null);
+	const [pending, setPending] = useState(false);
+	const inputRef = useRef<HTMLTextAreaElement>(null);
+
+	const answerMode = view.kind === "no_answer";
+
+	function applyAsk(result: AskResult, prompt: string, shown: string[]) {
 		if (result.type === "answer") {
 			setView({
 				kind: "answer",
-				prompt: currentPrompt,
+				prompt,
 				text: result.answer.text,
 				shownIds: [...shown, result.answer.id],
 			});
 		} else if (result.type === "no_answer") {
-			setView({ kind: "no_answer", prompt: currentPrompt });
+			setView({ kind: "no_answer", prompt });
 		} else {
 			setView({ kind: "safety", message: result.message });
 		}
 	}
 
-	async function ask() {
-		const trimmed = prompt.trim();
+	async function submit() {
+		const trimmed = input.trim();
 		if (!trimmed || pending) return;
+		setError(null);
 		setPending(true);
 		try {
-			const result = await askSecondhand({ data: { prompt: trimmed } });
-			applyAsk(result, trimmed, []);
+			if (view.kind === "no_answer") {
+				const result: LeaveResult = await leaveSecondhandAnswer({
+					data: { prompt: view.prompt, answer: trimmed },
+				});
+				if (result.type === "created") {
+					setView({ kind: "left", text: result.answer.text });
+					setInput("");
+				} else if (result.type === "already_there") {
+					setView({ kind: "note", text: "Already there." });
+					setInput("");
+				} else {
+					setError(REJECTION_MESSAGES[result.reason] ?? "Can't accept that.");
+				}
+			} else {
+				const result = await askSecondhand({ data: { prompt: trimmed } });
+				applyAsk(result, trimmed, []);
+				setInput("");
+			}
 		} finally {
 			setPending(false);
+			inputRef.current?.focus();
 		}
 	}
 
@@ -89,14 +130,15 @@ function Home() {
 	}
 
 	function reset() {
-		setPrompt("");
+		setInput("");
+		setError(null);
 		setView({ kind: "idle" });
-		promptRef.current?.focus();
+		inputRef.current?.focus();
 	}
 
 	return (
 		<main className="mx-auto flex min-h-dvh w-full max-w-2xl flex-col px-4">
-			<header className="py-6">
+			<header className="flex items-center justify-between py-5">
 				<button
 					type="button"
 					onClick={reset}
@@ -104,32 +146,65 @@ function Home() {
 				>
 					secondhand
 				</button>
+				<ThemeToggle />
 			</header>
 
-			<div className="flex flex-1 flex-col justify-center gap-8 pb-16">
-				{view.kind !== "idle" && (
-					<Response
-						view={view}
-						pending={pending}
-						onAgain={again}
-						onLeft={(text) => setView({ kind: "left", text })}
-						onNote={(text) => setView({ kind: "note", text })}
-					/>
-				)}
+			<motion.div
+				layout
+				className="flex flex-1 flex-col justify-center gap-7 pb-16"
+				transition={{ duration: 0.4, ease }}
+			>
+				<AnimatePresence mode="wait">
+					{view.kind !== "idle" && (
+						<motion.div
+							key={viewKey(view)}
+							initial={{ opacity: 0, y: 10 }}
+							animate={{ opacity: 1, y: 0 }}
+							exit={{ opacity: 0, y: -8 }}
+							transition={{ duration: 0.32, ease }}
+						>
+							<Response
+								view={view}
+								pending={pending}
+								onAgain={again}
+								onNote={(text) => setView({ kind: "note", text })}
+							/>
+						</motion.div>
+					)}
+				</AnimatePresence>
 
-				<Composer
-					ref={promptRef}
-					value={prompt}
-					onChange={setPrompt}
-					onSubmit={ask}
-					pending={pending}
-				/>
+				<motion.div layout transition={{ duration: 0.4, ease }}>
+					<Composer
+						ref={inputRef}
+						value={input}
+						answerMode={answerMode}
+						pending={pending}
+						onChange={(value) => {
+							setInput(value);
+							if (error) setError(null);
+						}}
+						onSubmit={submit}
+					/>
+					<AnimatePresence>
+						{error && (
+							<motion.p
+								initial={{ opacity: 0, height: 0 }}
+								animate={{ opacity: 1, height: "auto" }}
+								exit={{ opacity: 0, height: 0 }}
+								transition={{ duration: 0.2 }}
+								className="overflow-hidden pt-2 text-sm text-muted-foreground"
+							>
+								{error}
+							</motion.p>
+						)}
+					</AnimatePresence>
+				</motion.div>
 
 				<p className="text-center text-xs text-muted-foreground/70">
 					Prompts and answers may be saved. Don&apos;t write private information
 					here.
 				</p>
-			</div>
+			</motion.div>
 		</main>
 	);
 }
@@ -137,18 +212,20 @@ function Home() {
 function Composer({
 	ref,
 	value,
+	answerMode,
+	pending,
 	onChange,
 	onSubmit,
-	pending,
 }: {
 	ref: React.Ref<HTMLTextAreaElement>;
 	value: string;
+	answerMode: boolean;
+	pending: boolean;
 	onChange: (value: string) => void;
 	onSubmit: () => void;
-	pending: boolean;
 }) {
 	return (
-		<div className="relative rounded-2xl border border-input bg-background shadow-xs focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50">
+		<div className="relative rounded-3xl border border-input bg-card/60 shadow-sm backdrop-blur-sm transition-colors focus-within:border-ring/70 focus-within:ring-[3px] focus-within:ring-ring/40">
 			<Textarea
 				ref={ref}
 				value={value}
@@ -159,20 +236,31 @@ function Composer({
 						onSubmit();
 					}
 				}}
-				placeholder="Ask something."
+				placeholder={answerMode ? "Leave an answer." : "Ask something."}
 				rows={1}
 				autoFocus
-				className="max-h-48 resize-none border-0 bg-transparent px-4 py-3.5 pr-14 shadow-none focus-visible:ring-0"
+				className="max-h-48 resize-none border-0 bg-transparent px-4 py-3.5 pr-14 text-base shadow-none focus-visible:ring-0"
 			/>
 			<Button
 				type="button"
 				size="icon"
 				onClick={onSubmit}
 				disabled={pending || value.trim().length === 0}
-				className="absolute right-2.5 bottom-2.5 size-8 rounded-full"
-				aria-label="Ask something."
+				className="absolute right-2.5 bottom-2.5 size-9 rounded-full"
+				aria-label={answerMode ? "Leave an answer." : "Ask something."}
 			>
-				<ArrowUp />
+				<AnimatePresence mode="wait" initial={false}>
+					<motion.span
+						key={pending ? "pending" : "idle"}
+						initial={{ opacity: 0, scale: 0.6 }}
+						animate={{ opacity: 1, scale: 1 }}
+						exit={{ opacity: 0, scale: 0.6 }}
+						transition={{ duration: 0.15 }}
+						className="flex"
+					>
+						{pending ? <Loader2 className="animate-spin" /> : <ArrowUp />}
+					</motion.span>
+				</AnimatePresence>
 			</Button>
 		</div>
 	);
@@ -182,13 +270,11 @@ function Response({
 	view,
 	pending,
 	onAgain,
-	onLeft,
 	onNote,
 }: {
 	view: View;
 	pending: boolean;
 	onAgain: () => void;
-	onLeft: (text: string) => void;
 	onNote: (text: string) => void;
 }) {
 	if (view.kind === "answer") {
@@ -208,7 +294,12 @@ function Response({
 	}
 
 	if (view.kind === "no_answer") {
-		return <LeaveAnswer prompt={view.prompt} onLeft={onLeft} onNote={onNote} />;
+		return (
+			<div className="space-y-1">
+				<p>No answer yet.</p>
+				<p className="text-muted-foreground">Leave one?</p>
+			</div>
+		);
 	}
 
 	if (view.kind === "left") {
@@ -253,116 +344,57 @@ function AnswerControls({
 		}
 	}
 
-	if (reporting) {
-		return (
-			<div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
-				{REPORT_REASONS.map((reason) => (
-					<button
-						key={reason.value}
-						type="button"
-						disabled={sending}
-						onClick={() => report(reason.value)}
-						className="transition-colors hover:text-foreground disabled:opacity-50"
+	return (
+		<div className="flex min-h-6 items-center text-sm text-muted-foreground">
+			<AnimatePresence mode="wait" initial={false}>
+				{reporting ? (
+					<motion.div
+						key="reasons"
+						initial={{ opacity: 0, x: 6 }}
+						animate={{ opacity: 1, x: 0 }}
+						exit={{ opacity: 0, x: 6 }}
+						transition={{ duration: 0.18 }}
+						className="flex flex-wrap items-center gap-x-4 gap-y-1"
 					>
-						{reason.label}
-					</button>
-				))}
-			</div>
-		);
-	}
-
-	return (
-		<div className="flex items-center gap-4 text-sm text-muted-foreground">
-			<button
-				type="button"
-				disabled={pending}
-				onClick={onAgain}
-				className="transition-colors hover:text-foreground disabled:opacity-50"
-			>
-				Again
-			</button>
-			<button
-				type="button"
-				onClick={() => setReporting(true)}
-				className="transition-colors hover:text-foreground"
-			>
-				Report
-			</button>
-		</div>
-	);
-}
-
-function LeaveAnswer({
-	prompt,
-	onLeft,
-	onNote,
-}: {
-	prompt: string;
-	onLeft: (text: string) => void;
-	onNote: (text: string) => void;
-}) {
-	const [answer, setAnswer] = useState("");
-	const [error, setError] = useState<string | null>(null);
-	const [pending, setPending] = useState(false);
-
-	async function submit() {
-		const trimmed = answer.trim();
-		if (!trimmed || pending) return;
-		setPending(true);
-		setError(null);
-		try {
-			const result: LeaveResult = await leaveSecondhandAnswer({
-				data: { prompt, answer: trimmed },
-			});
-			if (result.type === "created") {
-				onLeft(result.answer.text);
-			} else if (result.type === "already_there") {
-				onNote("Already there.");
-			} else {
-				setError(REJECTION_MESSAGES[result.reason] ?? "Can't accept that.");
-			}
-		} finally {
-			setPending(false);
-		}
-	}
-
-	return (
-		<div className="space-y-4">
-			<div className="space-y-1">
-				<p>No answer yet.</p>
-				<p className="text-muted-foreground">Leave one?</p>
-			</div>
-			<div className="relative rounded-2xl border border-input bg-background shadow-xs focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50">
-				<Textarea
-					value={answer}
-					onChange={(event) => {
-						setAnswer(event.target.value);
-						if (error) setError(null);
-					}}
-					onKeyDown={(event) => {
-						if (event.key === "Enter" && !event.shiftKey) {
-							event.preventDefault();
-							submit();
-						}
-					}}
-					rows={1}
-					autoFocus
-					className={cn(
-						"max-h-48 resize-none border-0 bg-transparent px-4 py-3.5 pr-14 shadow-none focus-visible:ring-0",
-					)}
-				/>
-				<Button
-					type="button"
-					size="icon"
-					onClick={submit}
-					disabled={pending || answer.trim().length === 0}
-					className="absolute right-2.5 bottom-2.5 size-8 rounded-full"
-					aria-label="Leave answer"
-				>
-					<ArrowUp />
-				</Button>
-			</div>
-			{error && <p className="text-sm text-muted-foreground">{error}</p>}
+						{REPORT_REASONS.map((reason) => (
+							<button
+								key={reason.value}
+								type="button"
+								disabled={sending}
+								onClick={() => report(reason.value)}
+								className="transition-colors hover:text-foreground disabled:opacity-50"
+							>
+								{reason.label}
+							</button>
+						))}
+					</motion.div>
+				) : (
+					<motion.div
+						key="controls"
+						initial={{ opacity: 0 }}
+						animate={{ opacity: 1 }}
+						exit={{ opacity: 0, x: -6 }}
+						transition={{ duration: 0.18 }}
+						className="flex items-center gap-4"
+					>
+						<button
+							type="button"
+							disabled={pending}
+							onClick={onAgain}
+							className="transition-colors hover:text-foreground disabled:opacity-50"
+						>
+							Again
+						</button>
+						<button
+							type="button"
+							onClick={() => setReporting(true)}
+							className="transition-colors hover:text-foreground"
+						>
+							Report
+						</button>
+					</motion.div>
+				)}
+			</AnimatePresence>
 		</div>
 	);
 }
