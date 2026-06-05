@@ -1,8 +1,14 @@
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool } from "pg";
-import schemaSql from "./schema.sql?raw";
+import * as schema from "./db/schema";
 
 let pool: Pool | undefined;
+let db: AppDb | undefined;
 let migration: Promise<void> | undefined;
+
+export type AppDb = NodePgDatabase<typeof schema>;
 
 export function getPool(): Pool {
 	if (!pool) {
@@ -17,12 +23,25 @@ export function getPool(): Pool {
 	return pool;
 }
 
+export function createDb(targetPool: Pool): AppDb {
+	return drizzle(targetPool, { schema });
+}
+
+export function getDb(): AppDb {
+	db ??= createDb(getPool());
+	return db;
+}
+
+export async function migrateDb(targetDb: AppDb): Promise<void> {
+	await migrate(targetDb, { migrationsFolder: "./drizzle" });
+}
+
 export async function migratePool(targetPool: Pool): Promise<void> {
-	await targetPool.query(schemaSql);
+	await migrateDb(createDb(targetPool));
 }
 
 export async function migrateDatabase(): Promise<void> {
-	await migratePool(getPool());
+	await migrateDb(getDb());
 }
 
 export function ensureDatabase(): Promise<void> {
@@ -34,6 +53,7 @@ export async function closePool(): Promise<void> {
 	if (pool) {
 		await pool.end();
 		pool = undefined;
+		db = undefined;
 		migration = undefined;
 	}
 }

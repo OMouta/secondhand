@@ -1,5 +1,7 @@
-import type { Pool, PoolClient } from "pg";
-import { ensureDatabase, getPool } from "./db";
+import { type SQL, sql } from "drizzle-orm";
+import type { Pool } from "pg";
+import type { AppDb } from "./db";
+import { createDb, ensureDatabase, getDb } from "./db";
 import type { EmbedText } from "./embedding";
 import {
 	averageEmbedding,
@@ -72,6 +74,10 @@ type ArchiveDependencies = {
 	pool?: Pool;
 	embed?: EmbedText;
 	random?: () => number;
+};
+
+type DbExecutor = {
+	execute: (query: SQL) => Promise<{ rows: Array<unknown> }>;
 };
 
 type EmbeddingUsage = "prompt" | "answer";
@@ -150,10 +156,10 @@ export async function askArchive(
 		return { type: "no_answer", prompt };
 	}
 
-	const pool = await readyPool(dependencies.pool);
+	const db = await readyDb(dependencies.pool);
 	const random = dependencies.random ?? Math.random;
 
-	return withTransaction(pool, async (client) => {
+	return db.transaction(async (client) => {
 		const embedding = await getCachedEmbedding(client, {
 			usage: "prompt",
 			text: prompt,
@@ -209,10 +215,10 @@ export async function leaveAnswer(
 		return { type: "rejected", reason: answerModeration };
 	}
 
-	const pool = await readyPool(dependencies.pool);
+	const db = await readyDb(dependencies.pool);
 	const embed = dependencies.embed ?? embedText;
 
-	return withTransaction(pool, async (client) => {
+	return db.transaction(async (client) => {
 		const promptEmbedding = await getCachedEmbedding(client, {
 			usage: "prompt",
 			text: prompt,
@@ -243,31 +249,25 @@ export async function leaveAnswer(
 			return { type: "already_there" };
 		}
 
-		const created = await client.query<AnswerRow>(
-			`
+		const created = await client.execute(sql<AnswerRow>`
 				insert into answers (cluster_id, text, normalized_text, embedding)
-				values ($1, $2, $3, $4::vector)
-				returning id, text
-			`,
-			[
-				cluster.id,
-				answer,
-				normalizeText(answer),
-				toVectorLiteral(answerEmbedding),
-			],
-		);
+				values (
+					${cluster.id},
+					${answer},
+					${normalizeText(answer)},
+					${toVectorLiteral(answerEmbedding)}::vector
+				)
+				returning id, text, report_count
+		`);
 
-		await client.query(
-			`
+		await client.execute(sql`
 				update prompt_clusters
 				set answer_count = answer_count + 1,
 					updated_at = now()
-				where id = $1
-			`,
-			[cluster.id],
-		);
+				where id = ${cluster.id}
+		`);
 
-		const row = created.rows[0];
+		const row = firstRow<AnswerRow>(created);
 		if (!row) {
 			throw new Error("Answer insert failed");
 		}
@@ -288,61 +288,54 @@ export async function reportAnswer(
 	reason: ReportReason,
 	dependencies: Pick<ArchiveDependencies, "pool"> = {},
 ): Promise<{ ok: true; hidden: boolean } | { ok: false; reason: "not_found" }> {
-	const pool = await readyPool(dependencies.pool);
+	const db = await readyDb(dependencies.pool);
 
-	return withTransaction(pool, async (client) => {
-		const answer = await client.query<{
+	return db.transaction(async (client) => {
+		const answer = await client.execute(sql<{
 			id: string;
 			cluster_id: string;
 			report_count: number;
 			status: string;
-		}>(
-			`
+		}>`
 				select id, cluster_id, report_count, status
 				from answers
-				where id = $1
+				where id = ${answerId}
 				for update
-			`,
-			[answerId],
-		);
+		`);
 
-		const row = answer.rows[0];
+		const row = firstRow<{
+			id: string;
+			cluster_id: string;
+			report_count: number;
+			status: string;
+		}>(answer);
 		if (!row) {
 			return { ok: false, reason: "not_found" };
 		}
 
-		await client.query(
-			`
+		await client.execute(sql`
 				insert into reports (answer_id, reason)
-				values ($1, $2)
-			`,
-			[answerId, reason],
-		);
+				values (${answerId}, ${reason})
+		`);
 
 		const nextReportCount = row.report_count + 1;
 		const hidden =
 			row.status !== "hidden" && nextReportCount >= REPORT_HIDE_THRESHOLD;
-		await client.query(
-			`
+		await client.execute(sql`
 				update answers
-				set report_count = $2,
-					status = case when $3 then 'hidden'::answer_status else status end,
+				set report_count = ${nextReportCount},
+					status = case when ${hidden} then 'hidden'::answer_status else status end,
 					updated_at = now()
-				where id = $1
-			`,
-			[answerId, nextReportCount, hidden],
-		);
+				where id = ${answerId}
+		`);
 
 		if (hidden) {
-			await client.query(
-				`
+			await client.execute(sql`
 					update prompt_clusters
 					set answer_count = greatest(0, answer_count - 1),
 						updated_at = now()
-					where id = $1
-				`,
-				[row.cluster_id],
-			);
+					where id = ${row.cluster_id}
+			`);
 		}
 
 		return { ok: true, hidden: row.status === "hidden" || hidden };
@@ -352,25 +345,29 @@ export async function reportAnswer(
 export async function getArchiveStats(
 	dependencies: Pick<ArchiveDependencies, "pool"> = {},
 ) {
-	const pool = await readyPool(dependencies.pool);
-	const result = await pool.query<{
+	const db = await readyDb(dependencies.pool);
+	const result = await db.execute(sql<{
 		prompt_count: string;
 		cluster_count: string;
 		answer_count: string;
 		hidden_answer_count: string;
 		report_count: string;
-	}>(
-		`
+	}>`
 			select
 				(select count(*) from prompts) as prompt_count,
 				(select count(*) from prompt_clusters) as cluster_count,
 				(select count(*) from answers where status = 'active') as answer_count,
 				(select count(*) from answers where status = 'hidden') as hidden_answer_count,
 				(select count(*) from reports) as report_count
-		`,
-	);
+	`);
 
-	const row = result.rows[0];
+	const row = firstRow<{
+		prompt_count: string;
+		cluster_count: string;
+		answer_count: string;
+		hidden_answer_count: string;
+		report_count: string;
+	}>(result);
 	return {
 		promptCount: Number(row?.prompt_count ?? 0),
 		clusterCount: Number(row?.cluster_count ?? 0),
@@ -416,37 +413,34 @@ export function moderateText(
 	return undefined;
 }
 
-async function readyPool(pool: Pool | undefined): Promise<Pool> {
+async function readyDb(pool: Pool | undefined): Promise<AppDb> {
 	if (pool) {
-		return pool;
+		return createDb(pool);
 	}
 	await ensureDatabase();
-	return getPool();
+	return getDb();
 }
 
 async function findOrCreateCluster(
-	client: PoolClient,
+	client: DbExecutor,
 	text: string,
 	embedding: Array<number>,
 ): Promise<ClusterMatch> {
 	const vector = toVectorLiteral(embedding);
-	const match = await client.query<ClusterRow>(
-		`
+	const match = await client.execute(sql<ClusterRow>`
 			select
 				id,
 				representative_prompt,
 				embedding::text,
 				prompt_count,
-				1 - (embedding <=> $1::vector) as similarity
+				1 - (embedding <=> ${vector}::vector) as similarity
 			from prompt_clusters
 			where status = 'active'
-			order by embedding <=> $1::vector
+			order by embedding <=> ${vector}::vector
 			limit 1
-		`,
-		[vector],
-	);
+	`);
 
-	const row = match.rows[0];
+	const row = firstRow<ClusterRow>(match);
 	if (row && row.similarity >= MATCH_THRESHOLD) {
 		return {
 			id: row.id,
@@ -457,26 +451,23 @@ async function findOrCreateCluster(
 		};
 	}
 
-	const created = await client.query<ClusterRow>(
-		`
+	const created = await client.execute(sql<ClusterRow>`
 			insert into prompt_clusters (
 				representative_prompt,
 				embedding,
 				prompt_count,
 				answer_count
 			)
-			values ($1, $2::vector, 0, 0)
+			values (${text}, ${vector}::vector, 0, 0)
 			returning
 				id,
 				representative_prompt,
 				embedding::text,
 				prompt_count,
 				1::double precision as similarity
-		`,
-		[text, vector],
-	);
+	`);
 
-	const createdRow = created.rows[0];
+	const createdRow = firstRow<ClusterRow>(created);
 	if (!createdRow) {
 		throw new Error("Prompt cluster insert failed");
 	}
@@ -491,7 +482,7 @@ async function findOrCreateCluster(
 }
 
 async function getCachedEmbedding(
-	client: PoolClient,
+	client: DbExecutor,
 	input: {
 		usage: EmbeddingUsage;
 		text: string;
@@ -499,18 +490,15 @@ async function getCachedEmbedding(
 	},
 ): Promise<Array<number>> {
 	const normalizedText = normalizeText(input.text);
-	const cached = await client.query<{ embedding: string }>(
-		`
+	const cached = await client.execute(sql<{ embedding: string }>`
 			select embedding::text
 			from embedding_cache
-			where usage = $1
-				and normalized_text = $2
+			where usage = ${input.usage}
+				and normalized_text = ${normalizedText}
 			limit 1
-		`,
-		[input.usage, normalizedText],
-	);
+	`);
 
-	const cachedRow = cached.rows[0];
+	const cachedRow = firstRow<{ embedding: string }>(cached);
 	if (cachedRow) {
 		return fromVectorLiteral(cachedRow.embedding);
 	}
@@ -531,61 +519,52 @@ async function getCachedEmbedding(
 }
 
 async function findExistingPromptEmbedding(
-	client: PoolClient,
+	client: DbExecutor,
 	normalizedText: string,
 ): Promise<Array<number> | undefined> {
-	const result = await client.query<{ embedding: string }>(
-		`
+	const result = await client.execute(sql<{ embedding: string }>`
 			select embedding::text
 			from prompts
-			where normalized_text = $1
+			where normalized_text = ${normalizedText}
 			order by created_at desc
 			limit 1
-		`,
-		[normalizedText],
-	);
+	`);
 
-	const row = result.rows[0];
+	const row = firstRow<{ embedding: string }>(result);
 	return row ? fromVectorLiteral(row.embedding) : undefined;
 }
 
 async function findExistingAnswerEmbedding(
-	client: PoolClient,
+	client: DbExecutor,
 	normalizedText: string,
 ): Promise<Array<number> | undefined> {
-	const result = await client.query<{ embedding: string }>(
-		`
+	const result = await client.execute(sql<{ embedding: string }>`
 			select embedding::text
 			from answers
-			where normalized_text = $1
+			where normalized_text = ${normalizedText}
 			order by created_at desc
 			limit 1
-		`,
-		[normalizedText],
-	);
+	`);
 
-	const row = result.rows[0];
+	const row = firstRow<{ embedding: string }>(result);
 	return row ? fromVectorLiteral(row.embedding) : undefined;
 }
 
 async function cacheEmbedding(
-	client: PoolClient,
+	client: DbExecutor,
 	usage: EmbeddingUsage,
 	normalizedText: string,
 	embedding: Array<number>,
 ): Promise<void> {
-	await client.query(
-		`
+	await client.execute(sql`
 			insert into embedding_cache (usage, normalized_text, embedding)
-			values ($1, $2, $3::vector)
+			values (${usage}, ${normalizedText}, ${toVectorLiteral(embedding)}::vector)
 			on conflict (usage, normalized_text) do nothing
-		`,
-		[usage, normalizedText, toVectorLiteral(embedding)],
-	);
+	`);
 }
 
 async function insertPrompt(
-	client: PoolClient,
+	client: DbExecutor,
 	input: {
 		text: string;
 		embedding: Array<number>;
@@ -593,8 +572,7 @@ async function insertPrompt(
 		matchedSimilarity: number;
 	},
 ): Promise<string> {
-	const result = await client.query<{ id: string }>(
-		`
+	const result = await client.execute(sql<{ id: string }>`
 			insert into prompts (
 				text,
 				normalized_text,
@@ -602,19 +580,17 @@ async function insertPrompt(
 				cluster_id,
 				matched_similarity
 			)
-			values ($1, $2, $3::vector, $4, $5)
+			values (
+				${input.text},
+				${normalizeText(input.text)},
+				${toVectorLiteral(input.embedding)}::vector,
+				${input.clusterId},
+				${roundScore(input.matchedSimilarity)}
+			)
 			returning id
-		`,
-		[
-			input.text,
-			normalizeText(input.text),
-			toVectorLiteral(input.embedding),
-			input.clusterId,
-			roundScore(input.matchedSimilarity),
-		],
-	);
+	`);
 
-	const row = result.rows[0];
+	const row = firstRow<{ id: string }>(result);
 	if (!row) {
 		throw new Error("Prompt insert failed");
 	}
@@ -623,7 +599,7 @@ async function insertPrompt(
 }
 
 async function updateClusterForPrompt(
-	client: PoolClient,
+	client: DbExecutor,
 	cluster: ClusterMatch,
 	embedding: Array<number>,
 ): Promise<void> {
@@ -632,37 +608,32 @@ async function updateClusterForPrompt(
 		embedding,
 		cluster.promptCount,
 	);
-	await client.query(
-		`
+	await client.execute(sql`
 			update prompt_clusters
-			set embedding = $2::vector,
+			set embedding = ${toVectorLiteral(nextEmbedding)}::vector,
 				prompt_count = prompt_count + 1,
 				updated_at = now()
-			where id = $1
-		`,
-		[cluster.id, toVectorLiteral(nextEmbedding)],
-	);
+			where id = ${cluster.id}
+	`);
 }
 
 async function pickAnswer(
-	client: PoolClient,
+	client: DbExecutor,
 	clusterId: string,
 	excludeAnswerIds: Array<string>,
 	random: () => number,
 ): Promise<PublicAnswer | undefined> {
-	const result = await client.query<AnswerRow>(
-		`
+	const excludedAnswerIds = uuidArrayLiteral(excludeAnswerIds);
+	const result = await client.execute(sql<AnswerRow>`
 			select id, text, report_count
 			from answers
-			where cluster_id = $1
+			where cluster_id = ${clusterId}
 				and status = 'active'
-				and not (id = any($2::uuid[]))
+				and not (id = any(${excludedAnswerIds}::uuid[]))
 			order by created_at asc
-		`,
-		[clusterId, excludeAnswerIds],
-	);
+	`);
 
-	const row = pickWeightedAnswer(result.rows, random);
+	const row = pickWeightedAnswer(allRows<AnswerRow>(result), random);
 	if (!row) {
 		return undefined;
 	}
@@ -698,53 +669,27 @@ function pickWeightedAnswer(
 }
 
 async function hasDuplicateAnswer(
-	client: PoolClient,
+	client: DbExecutor,
 	input: {
 		clusterId: string;
 		answer: string;
 		embedding: Array<number>;
 	},
 ): Promise<boolean> {
-	const result = await client.query<{ exists: boolean }>(
-		`
+	const result = await client.execute(sql<{ exists: boolean }>`
 			select exists(
 				select 1
 				from answers
-				where cluster_id = $1
+				where cluster_id = ${input.clusterId}
 					and status = 'active'
 					and (
-						normalized_text = $2
-						or 1 - (embedding <=> $3::vector) >= $4
+						normalized_text = ${normalizeText(input.answer)}
+						or 1 - (embedding <=> ${toVectorLiteral(input.embedding)}::vector) >= ${DUPLICATE_THRESHOLD}
 					)
 			) as exists
-		`,
-		[
-			input.clusterId,
-			normalizeText(input.answer),
-			toVectorLiteral(input.embedding),
-			DUPLICATE_THRESHOLD,
-		],
-	);
+	`);
 
-	return Boolean(result.rows[0]?.exists);
-}
-
-async function withTransaction<T>(
-	pool: Pool,
-	operation: (client: PoolClient) => Promise<T>,
-): Promise<T> {
-	const client = await pool.connect();
-	try {
-		await client.query("begin");
-		const result = await operation(client);
-		await client.query("commit");
-		return result;
-	} catch (error) {
-		await client.query("rollback");
-		throw error;
-	} finally {
-		client.release();
-	}
+	return Boolean(firstRow<{ exists: boolean }>(result)?.exists);
 }
 
 function isSafetyPrompt(text: string): boolean {
@@ -759,4 +704,23 @@ function cleanText(text: string): string {
 
 function roundScore(score: number): number {
 	return Math.round(score * 100) / 100;
+}
+
+function uuidArrayLiteral(ids: Array<string>): SQL {
+	if (ids.length === 0) {
+		return sql.raw("array[]");
+	}
+
+	return sql`array[${sql.join(
+		ids.map((id) => sql`${id}::uuid`),
+		sql`, `,
+	)}]`;
+}
+
+function firstRow<T>(result: { rows: Array<unknown> }): T | undefined {
+	return result.rows[0] as T | undefined;
+}
+
+function allRows<T>(result: { rows: Array<unknown> }): Array<T> {
+	return result.rows as Array<T>;
 }

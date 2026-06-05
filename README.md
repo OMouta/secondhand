@@ -22,7 +22,7 @@ Required environment:
 DATABASE_URL=postgres://...
 ```
 
-Postgres must have `pgvector` available. The app creates its tables on startup.
+Postgres must have `pgvector` available. Migrations are managed with Drizzle.
 Embeddings run locally with Transformers.js and are cached in Postgres.
 
 Build for production:
