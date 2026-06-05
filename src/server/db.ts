@@ -33,7 +33,10 @@ export function getDb(): AppDb {
 }
 
 export async function migrateDb(targetDb: AppDb): Promise<void> {
-	await migrate(targetDb, { migrationsFolder: "./drizzle" });
+	await migrate(targetDb, {
+		migrationsFolder: "./drizzle",
+		migrationsSchema: "public",
+	});
 }
 
 export async function migratePool(targetPool: Pool): Promise<void> {
