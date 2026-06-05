@@ -74,6 +74,8 @@ function Home() {
 	const [error, setError] = useState<string | null>(null);
 	const [pending, setPending] = useState(false);
 	const [menuIndex, setMenuIndex] = useState(0);
+	const [reporting, setReporting] = useState(false);
+	const [reportSending, setReportSending] = useState(false);
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 
 	// The composer always defaults to asking; leaving an answer is an explicit,
@@ -82,25 +84,29 @@ function Home() {
 	const answerMode = forceAnswer;
 	const hasThread = view.kind !== "idle";
 
-	function applyAsk(result: AskResult, prompt: string, shown: string[]) {
-		if (result.type === "answer") {
-			setView({
-				kind: "answer",
-				prompt,
-				text: result.answer.text,
-				shownIds: [...shown, result.answer.id],
-			});
-		} else if (result.type === "no_answer") {
-			setView({ kind: "no_answer", prompt });
-		} else {
-			setView({ kind: "safety", message: result.message });
-		}
-	}
+	const applyAsk = useCallback(
+		(result: AskResult, prompt: string, shown: string[]) => {
+			if (result.type === "answer") {
+				setView({
+					kind: "answer",
+					prompt,
+					text: result.answer.text,
+					shownIds: [...shown, result.answer.id],
+				});
+			} else if (result.type === "no_answer") {
+				setView({ kind: "no_answer", prompt });
+			} else {
+				setView({ kind: "safety", message: result.message });
+			}
+		},
+		[],
+	);
 
 	async function submit() {
 		const trimmed = input.trim();
 		if (!trimmed || pending) return;
 		setError(null);
+		setReporting(false);
 		setPending(true);
 		try {
 			if (answerMode) {
@@ -131,8 +137,9 @@ function Home() {
 		}
 	}
 
-	async function again() {
+	const again = useCallback(async () => {
 		if (view.kind !== "answer" || pending) return;
+		setReporting(false);
 		setPending(true);
 		try {
 			const result = await askSecondhand({
@@ -142,12 +149,58 @@ function Home() {
 		} finally {
 			setPending(false);
 		}
-	}
+	}, [view, pending, applyAsk]);
+
+	const startReport = useCallback(() => {
+		if (view.kind !== "answer") return;
+		setReporting(true);
+	}, [view.kind]);
+
+	const report = useCallback(
+		async (reason: ReportReason) => {
+			if (view.kind !== "answer" || reportSending) return;
+			const answerId = view.shownIds[view.shownIds.length - 1];
+			setReportSending(true);
+			try {
+				await reportSecondhandAnswer({ data: { answerId, reason } });
+				setReporting(false);
+				setView({ kind: "note", text: "Reported." });
+			} finally {
+				setReportSending(false);
+			}
+		},
+		[view, reportSending],
+	);
+
+	// While the report picker is open, number keys pick a reason and Escape
+	// cancels — handled globally so it works no matter where focus landed.
+	useEffect(() => {
+		if (!reporting) return;
+		function onKeyDown(event: KeyboardEvent) {
+			if (event.key === "Escape") {
+				event.preventDefault();
+				setReporting(false);
+				return;
+			}
+			const choice = Number(event.key);
+			if (
+				Number.isInteger(choice) &&
+				choice >= 1 &&
+				choice <= REPORT_REASONS.length
+			) {
+				event.preventDefault();
+				report(REPORT_REASONS[choice - 1].value);
+			}
+		}
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [reporting, report]);
 
 	const reset = useCallback(() => {
 		setInput("");
 		setError(null);
 		setForceAnswer(false);
+		setReporting(false);
 		setAsked("");
 		setView({ kind: "idle" });
 		inputRef.current?.focus();
@@ -156,6 +209,7 @@ function Home() {
 	const startAnswer = useCallback(() => {
 		if (!answerPrompt) return;
 		setForceAnswer(true);
+		setReporting(false);
 		setError(null);
 		setInput("");
 		inputRef.current?.focus();
@@ -187,8 +241,36 @@ function Home() {
 				enabled: Boolean(answerPrompt) && !answerMode,
 				run: startAnswer,
 			},
+			{
+				id: "again",
+				trigger: "again",
+				title: "Again",
+				description: "Show another answer",
+				keybind: { mod: true, shift: true, key: "g" },
+				enabled: view.kind === "answer" && !pending,
+				run: again,
+			},
+			{
+				id: "report",
+				trigger: "report",
+				title: "Report",
+				description: "Report this answer",
+				keybind: { mod: true, shift: true, key: "e" },
+				enabled: view.kind === "answer" && !reporting,
+				run: startReport,
+			},
 		],
-		[answerPrompt, answerMode, reset, startAnswer],
+		[
+			answerPrompt,
+			answerMode,
+			view.kind,
+			pending,
+			reporting,
+			reset,
+			startAnswer,
+			again,
+			startReport,
+		],
 	);
 
 	useKeybinds(commands);
@@ -207,10 +289,13 @@ function Home() {
 		command.run();
 	}
 
-	const answerCommand = commands.find((command) => command.id === "answer");
-	const answerHint = answerCommand?.keybind
-		? formatKeybind(answerCommand.keybind)
-		: "";
+	const hintFor = (id: string) => {
+		const command = commands.find((entry) => entry.id === id);
+		return command?.keybind ? formatKeybind(command.keybind) : "";
+	};
+	const answerHint = hintFor("answer");
+	const againHint = hintFor("again");
+	const reportHint = hintFor("report");
 
 	return (
 		<main className="mx-auto flex min-h-dvh w-full max-w-2xl flex-col px-4">
@@ -265,8 +350,13 @@ function Home() {
 										<Response
 											view={view}
 											pending={pending}
+											reporting={reporting}
+											reportSending={reportSending}
+											againHint={againHint}
+											reportHint={reportHint}
 											onAgain={again}
-											onNote={(text) => setView({ kind: "note", text })}
+											onStartReport={startReport}
+											onReport={report}
 										/>
 									</div>
 								</motion.div>
@@ -487,23 +577,37 @@ function Composer({
 function Response({
 	view,
 	pending,
+	reporting,
+	reportSending,
+	againHint,
+	reportHint,
 	onAgain,
-	onNote,
+	onStartReport,
+	onReport,
 }: {
 	view: View;
 	pending: boolean;
+	reporting: boolean;
+	reportSending: boolean;
+	againHint: string;
+	reportHint: string;
 	onAgain: () => void;
-	onNote: (text: string) => void;
+	onStartReport: () => void;
+	onReport: (reason: ReportReason) => void;
 }) {
 	if (view.kind === "answer") {
 		return (
 			<div className="space-y-3">
 				<p className="leading-relaxed whitespace-pre-wrap">{view.text}</p>
 				<AnswerControls
-					answerId={view.shownIds[view.shownIds.length - 1]}
 					pending={pending}
+					reporting={reporting}
+					reportSending={reportSending}
+					againHint={againHint}
+					reportHint={reportHint}
 					onAgain={onAgain}
-					onReported={() => onNote("Reported.")}
+					onStartReport={onStartReport}
+					onReport={onReport}
 				/>
 			</div>
 		);
@@ -534,30 +638,24 @@ function Response({
 }
 
 function AnswerControls({
-	answerId,
 	pending,
+	reporting,
+	reportSending,
+	againHint,
+	reportHint,
 	onAgain,
-	onReported,
+	onStartReport,
+	onReport,
 }: {
-	answerId: string;
 	pending: boolean;
+	reporting: boolean;
+	reportSending: boolean;
+	againHint: string;
+	reportHint: string;
 	onAgain: () => void;
-	onReported: () => void;
+	onStartReport: () => void;
+	onReport: (reason: ReportReason) => void;
 }) {
-	const [reporting, setReporting] = useState(false);
-	const [sending, setSending] = useState(false);
-
-	async function report(reason: ReportReason) {
-		if (sending) return;
-		setSending(true);
-		try {
-			await reportSecondhandAnswer({ data: { answerId, reason } });
-			onReported();
-		} finally {
-			setSending(false);
-		}
-	}
-
 	return (
 		<div className="flex min-h-6 items-center text-sm text-muted-foreground">
 			<AnimatePresence mode="wait" initial={false}>
@@ -568,17 +666,18 @@ function AnswerControls({
 						animate={{ opacity: 1, x: 0 }}
 						exit={{ opacity: 0, x: 6 }}
 						transition={{ duration: 0.18 }}
-						className="flex flex-wrap items-center gap-x-4 gap-y-1"
+						className="flex flex-wrap items-center gap-x-3 gap-y-1"
 					>
-						{REPORT_REASONS.map((reason) => (
+						{REPORT_REASONS.map((reason, i) => (
 							<button
 								key={reason.value}
 								type="button"
-								disabled={sending}
-								onClick={() => report(reason.value)}
-								className="transition-colors hover:text-foreground disabled:opacity-50"
+								disabled={reportSending}
+								onClick={() => onReport(reason.value)}
+								className="inline-flex items-center transition-colors hover:text-foreground disabled:opacity-50"
 							>
 								{reason.label}
+								<Kbd>{i + 1}</Kbd>
 							</button>
 						))}
 					</motion.div>
@@ -595,16 +694,18 @@ function AnswerControls({
 							type="button"
 							disabled={pending}
 							onClick={onAgain}
-							className="transition-colors hover:text-foreground disabled:opacity-50"
+							className="inline-flex items-center transition-colors hover:text-foreground disabled:opacity-50"
 						>
 							Again
+							{againHint && <Kbd>{againHint}</Kbd>}
 						</button>
 						<button
 							type="button"
-							onClick={() => setReporting(true)}
-							className="transition-colors hover:text-foreground"
+							onClick={onStartReport}
+							className="inline-flex items-center transition-colors hover:text-foreground"
 						>
 							Report
+							{reportHint && <Kbd>{reportHint}</Kbd>}
 						</button>
 					</motion.div>
 				)}
