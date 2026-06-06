@@ -1,8 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { ArrowUp, Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommandMenu } from "#/components/command-menu.tsx";
+import { Logo } from "#/components/logo.tsx";
 import { ThemeToggle } from "#/components/theme-toggle.tsx";
 import { Button } from "#/components/ui/button.tsx";
 import { Textarea } from "#/components/ui/textarea.tsx";
@@ -49,6 +50,13 @@ const REJECTION_MESSAGES: Record<string, string> = {
 
 const ease = [0.16, 1, 0.3, 1] as const;
 
+// Minimum time the "processing" indicator stays up, so answers don't snap in.
+const PROCESSING_MS = 750;
+
+function delay(ms: number) {
+	return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
 function viewKey(view: View): string {
 	switch (view.kind) {
 		case "answer":
@@ -76,13 +84,14 @@ function Home() {
 	const [menuIndex, setMenuIndex] = useState(0);
 	const [reporting, setReporting] = useState(false);
 	const [reportSending, setReportSending] = useState(false);
+	const [thinking, setThinking] = useState(false);
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 
 	// The composer always defaults to asking; leaving an answer is an explicit,
 	// opt-in mode for the current prompt (toggle below the composer or keybind).
 	const answerPrompt = asked;
 	const answerMode = forceAnswer;
-	const hasThread = view.kind !== "idle";
+	const hasThread = view.kind !== "idle" || thinking;
 
 	const applyAsk = useCallback(
 		(result: AskResult, prompt: string, shown: string[]) => {
@@ -107,10 +116,11 @@ function Home() {
 		if (!trimmed || pending) return;
 		setError(null);
 		setReporting(false);
-		setPending(true);
-		try {
-			if (answerMode) {
-				if (!answerPrompt) return;
+
+		if (answerMode) {
+			if (!answerPrompt) return;
+			setPending(true);
+			try {
 				const result: LeaveResult = await leaveSecondhandAnswer({
 					data: { prompt: answerPrompt, answer: trimmed },
 				});
@@ -125,13 +135,25 @@ function Home() {
 				} else {
 					setError(REJECTION_MESSAGES[result.reason] ?? "Can't accept that.");
 				}
-			} else {
-				const result = await askSecondhand({ data: { prompt: trimmed } });
-				setAsked(trimmed);
-				applyAsk(result, trimmed, []);
-				setInput("");
+			} finally {
+				setPending(false);
+				inputRef.current?.focus();
 			}
+			return;
+		}
+
+		setAsked(trimmed);
+		setInput("");
+		setThinking(true);
+		setPending(true);
+		try {
+			const [result] = await Promise.all([
+				askSecondhand({ data: { prompt: trimmed } }),
+				delay(PROCESSING_MS),
+			]);
+			applyAsk(result, trimmed, []);
 		} finally {
+			setThinking(false);
 			setPending(false);
 			inputRef.current?.focus();
 		}
@@ -140,13 +162,18 @@ function Home() {
 	const again = useCallback(async () => {
 		if (view.kind !== "answer" || pending) return;
 		setReporting(false);
+		setThinking(true);
 		setPending(true);
 		try {
-			const result = await askSecondhand({
-				data: { prompt: view.prompt, excludeAnswerIds: view.shownIds },
-			});
+			const [result] = await Promise.all([
+				askSecondhand({
+					data: { prompt: view.prompt, excludeAnswerIds: view.shownIds },
+				}),
+				delay(PROCESSING_MS),
+			]);
 			applyAsk(result, view.prompt, view.shownIds);
 		} finally {
+			setThinking(false);
 			setPending(false);
 		}
 	}, [view, pending, applyAsk]);
@@ -201,6 +228,7 @@ function Home() {
 		setError(null);
 		setForceAnswer(false);
 		setReporting(false);
+		setThinking(false);
 		setAsked("");
 		setView({ kind: "idle" });
 		inputRef.current?.focus();
@@ -303,8 +331,9 @@ function Home() {
 				<button
 					type="button"
 					onClick={reset}
-					className="text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+					className="flex items-center gap-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
 				>
+					<Logo className="size-5 text-foreground" />
 					secondhand
 				</button>
 				<ThemeToggle />
@@ -338,26 +367,34 @@ function Home() {
 
 							<AnimatePresence mode="wait">
 								<motion.div
-									key={viewKey(view)}
+									key={thinking ? "thinking" : viewKey(view)}
 									layout
 									initial={{ opacity: 0, y: 10 }}
 									animate={{ opacity: 1, y: 0 }}
 									exit={{ opacity: 0, y: -8 }}
-									transition={{ duration: 0.32, ease, delay: 0.05 }}
+									transition={{
+										duration: 0.32,
+										ease,
+										delay: thinking ? 0 : 0.05,
+									}}
 									className="flex justify-start"
 								>
 									<div className="max-w-[85%] rounded-2xl rounded-bl-md border border-border bg-muted/40 px-4 py-3">
-										<Response
-											view={view}
-											pending={pending}
-											reporting={reporting}
-											reportSending={reportSending}
-											againHint={againHint}
-											reportHint={reportHint}
-											onAgain={again}
-											onStartReport={startReport}
-											onReport={report}
-										/>
+										{thinking ? (
+											<Thinking />
+										) : (
+											<Response
+												view={view}
+												pending={pending}
+												reporting={reporting}
+												reportSending={reportSending}
+												againHint={againHint}
+												reportHint={reportHint}
+												onAgain={again}
+												onStartReport={startReport}
+												onReport={report}
+											/>
+										)}
 									</div>
 								</motion.div>
 							</AnimatePresence>
@@ -598,7 +635,10 @@ function Response({
 	if (view.kind === "answer") {
 		return (
 			<div className="space-y-3">
-				<p className="leading-relaxed whitespace-pre-wrap">{view.text}</p>
+				<StreamingText
+					text={view.text}
+					className="leading-relaxed whitespace-pre-wrap"
+				/>
 				<AnswerControls
 					pending={pending}
 					reporting={reporting}
@@ -631,10 +671,67 @@ function Response({
 	}
 
 	if (view.kind === "safety") {
-		return <p className="leading-relaxed">{view.message}</p>;
+		return <StreamingText text={view.message} className="leading-relaxed" />;
 	}
 
 	return null;
+}
+
+function StreamingText({
+	text,
+	className,
+}: {
+	text: string;
+	className?: string;
+}) {
+	const reduce = useReducedMotion();
+	const tokens = text.match(/\S+\s*/g) ?? [text];
+
+	if (reduce) {
+		return <p className={className}>{text}</p>;
+	}
+
+	return (
+		<motion.p
+			className={className}
+			initial="hidden"
+			animate="show"
+			variants={{ show: { transition: { staggerChildren: 0.035 } } }}
+		>
+			{tokens.map((token, i) => (
+				<motion.span
+					// biome-ignore lint/suspicious/noArrayIndexKey: tokens are positional and the block remounts per answer
+					key={i}
+					variants={{
+						hidden: { opacity: 0 },
+						show: { opacity: 1, transition: { duration: 0.18 } },
+					}}
+				>
+					{token}
+				</motion.span>
+			))}
+		</motion.p>
+	);
+}
+
+function Thinking() {
+	return (
+		<output className="flex items-center gap-1 py-1" aria-label="Processing">
+			{[0, 1, 2].map((i) => (
+				<motion.span
+					key={i}
+					className="size-1.5 rounded-full bg-muted-foreground"
+					animate={{ opacity: [0.25, 1, 0.25] }}
+					transition={{
+						duration: 1,
+						repeat: Number.POSITIVE_INFINITY,
+						ease: "easeInOut",
+						delay: i * 0.18,
+					}}
+				/>
+			))}
+		</output>
+	);
 }
 
 function AnswerControls({
